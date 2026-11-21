@@ -1,12 +1,12 @@
 # 技术栈与数据接口
 
-本表供开发者选用同一套运行环境。教师脚本可以在本地抽查 Parquet。集群作业、模型及演示应用是第 6 组的实施方案，五台机器的配置、框架版本和资源上限均待 P02 实测。版本锁定后在本表填入已验证组合，在 [第三方清单](THIRD_PARTY_NOTICES.md) 填入对应发行版。
+P01 已在本地实测 CPython 3.12.14 与 PyArrow 25.0.1，后者固定在 [依赖清单](requirements.txt)。P02 起的选型待实施，五节点配置、版本和资源上限由 P02 实测。各发行版及许可证见 [第三方清单](THIRD_PARTY_NOTICES.md)。
 
 ## 按流程选型
 
 | 流程与任务 | 工具 | 输入、处理与输出 | 运行位置和验证 |
 |---|---|---|---|
-| 原材解包与抽查（P00/P01） | unar、Python、PyArrow、pandas、DuckDB | 解开外层 RAR；PyArrow 按列/分片读取，pandas 查看小样本，DuckDB 直接扫描 Parquet 实现独立核数。教师脚本有 `iter_shards`、`load_runs`、`query` 三个入口 | 本地或协调节点；原件只读，输入目录由调用方传入 |
+| 输入准备（P01） | unar、Python、PyArrow、`tarfile` | 解包 RAR。按列分批读取 Parquet，按仓库 TAR 的成员清单建立 attempt 索引 | 本地实测两种模式，按参数读取源目录。可用教师脚本的 `iter_shards`、`load_runs`（pandas）或 `query`（DuckDB）独立抽查 |
 | 批处理环境（P02） | 集群 Linux、JVM、Apache Spark、PySpark、`spark-submit` | 提交驱动程序并将清洗、聚合、分区写回分发给执行器 | 先盘点五台机器。已有可用 YARN 就沿用；空环境拟用 Spark Standalone，一台协调、四台工作。以实际执行器记录认定多机运行。[集群说明](https://spark.apache.org/docs/latest/cluster-overview.html) |
 | 数据存取与清洗（P02） | 共享存储、Parquet、Spark SQL / DataFrame | 分片投影、类型和 UTC 转换、主键与状态审计、分区落盘。按读取模式比较分区方案，避免按 run 建目录 | 优先用已有 HDFS 或所有节点同路径可访问的共享挂载；没有共享存储时，先在 P02 明确部署可用方案并验证跨节点读写。[Spark Parquet 文档](https://spark.apache.org/docs/latest/sql-data-sources-parquet.html) |
 | 特征工程（P03） | PySpark SQL、聚合函数、Window | 由 run 表构建工作流画像与连续周面板；按时间截点另算历史特征 | 全量在集群聚合，DuckDB/手算核验小样本；持久化特征使用 Parquet |
@@ -19,7 +19,7 @@
 
 ## 课程资料与查阅路径
 
-以课程发布或小组共享的课件为准，按下表的原文件名和页码查找。页码按幻灯片顺序计，技术实现再对照 P02 实测发行版的接口文档。
+按原文件名和幻灯片页码查找课程群或组内共享课件，开发时对照实际发行版。
 
 | 对应任务 | 课程资料 | 项目中的用法与对照入口 |
 |---|---|---|
@@ -30,9 +30,9 @@
 
 ## 表的粒度与分析口径
 
-P01 的 `runs_input.parquet` 投影原始列，保留字符串时间戳、状态和原始空值，供 P02 清洗。原始 `log_*_count` 描述源数据的归档统计。是否在课程子集中找到 ZIP，以 `attempt_index.parquet` 为准。P01 用 PyArrow 逐批读写 Parquet。两份输入目录、命令和示例见 [README](README.md)。
+P01 的 `runs_input.parquet` 从 19 个源字段中读取 13 列，保留时间字符串、状态和空值，供 P02 清洗。`log_archive_count`、`log_file_count` 和 `empty_archive_count` 属于源数据统计。`attempt_index.parquet` 记录课程 TAR 中的 ZIP 位置，ZIP 内容及目标步骤由后续阶段核验。[输出模式与命令](README.md#开发者第一次运行)
 
-下表为 P02–P07 的最小数据约定。各表主键列非空。ID 用 int64，尝试编号用从 1 开始的 int32。路径保留原始文本及大小写。UTC 时间使用 Parquet 微秒时间戳，Spark 会话设为 UTC，周键使用对应的周一日期。
+下表为 attempt 索引的现有字段与 P02–P07 的下游约定。主键非空，ID 使用 int64，attempt 为从 1 起的 int32，路径保留原文及大小写。下游用 Parquet 微秒 UTC 时间戳，Spark 会话设为 UTC，周键取周一日期。
 
 | 粒度与产物 | 唯一键 | 最小字段、单位与空值 |
 |---|---|---|
@@ -42,9 +42,9 @@ P01 的 `runs_input.parquet` 投影原始列，保留字符串时间戳、状态
 | attempt · `attempt_index`、`attempt_fingerprint` | `run_id, attempt` | 索引含 `repo_id`、输入根目录相对 `tar_path`、TAR 内 `tar_member` 与 ZIP 字节数 `archive_bytes`。指纹保留 `parse_status`（`parsed`、`no_target_member` 或 `failed`）、有效行数 `eligible_lines` 和信号计数。已解析零命中为 0，未能解析的特征为 null |
 | 证据行 · `log_evidence` | `run_id, attempt, member, line_no` | `member` 是 ZIP 内文件名，`line_no` 是解码后原成员从 1 起算的行号，成员和行号不因过滤重排。同一行的多种命中放在其标签列表，展示字段为脱敏摘录 |
 
-用 `repo_id, workflow_path` 把每个 run 连到一条工作流画像。用创建时间在 UTC 得到周一日期后，每个 run 连到一条周记录。按 `run_id, attempt` 从 attempt 连到多条证据时保留归档与成员定位。若输出以 run 为粒度，先把信号从证据归到 attempt、再聚合成每 run 一行的 `run_fingerprint`，随后与 `runs_clean` 左连接。归并时保留归档数、解析成功数和特征分母。无归档的 run 保留主表行，日志特征为空。合并后校验总行数和唯一 run 数等于主表。模型分数、参数和证据键随批次保存。
+按工作流键和 UTC 周键将 run 分别连到一条画像与一条周记录。证据按 `run_id, attempt` 连接并保留归档与成员定位。run 级输出先聚合证据到 attempt，再聚合到 `run_fingerprint`，保留归档数、解析成功数和特征分母。与 `runs_clean` 左连，无归档行的日志特征为空。核对总行数与唯一 run 数均等于主表。模型分数、参数和证据键随批次保存。
 
-样本使用各场景最小的 run ID。单次运行基于全表按工作流计数；多 attempt 要求课程包中实际索引到至少两个 ZIP。另加入按工作流键排序最前的 12 个有归档且有 20–150 次观测的工作流的完整记录，输出按 ID 去重。场景可能共用一个 run。批次 ID 由输入文件相对路径、内容 SHA-256、模式及接口和样本规则版本确定。在同一输出根目录先写隐藏临时目录，全部完成后一次性重命名发布。
+样本取各场景最小的 run ID。单次工作流按全表计数，多 attempt 以至少两个已索引 ZIP 为准。另按键选最多 12 个有归档且有 20–150 次运行的工作流，保留完整记录。场景可共享 run，输出校验 run ID 唯一。批次 ID 由输入相对路径及内容 SHA-256、模式、接口版本和样本参数决定。写完隐藏目录后一次性重命名发布。复用时检查完成状态、批次 ID、产物列表和文件大小。
 
 - **时间。** `updated_at - created_at` 表示从创建到最后更新的观测耗时，可能涵盖等待或重跑。报告标清代理量；精确到某执行阶段的结论须用日志时间戳核验。UTC 小时仅支持 UTC 口径的结论。
 - **结果。** 跳过率取 `skipped / 全部 run`。建议失败率定义为 `failure / (success + failure)`，命名为“成功/失败结论中的失败率”；其余结论另列。分母为零记缺失。重试率取已知尝试次数的 run 中 `run_attempts > 1` 的比例，重跑次数为尝试次数减一；日志里的进程内重试另算。
@@ -53,4 +53,4 @@ P01 的 `runs_input.parquet` 投影原始列，保留字符串时间戳、状态
 
 ## 环境定版与复现
 
-P02 由万明浩记录各节点 OS/架构、JDK 发行版及主版本、Spark 和 PySpark 精确版本、驱动与执行器的 Python 版本、共享路径、执行器数量和内存。根据实装 Spark 发行版选兼容的 Java/Python，保持驱动与执行器 Python 小版本一致。在 README 增补实测入口，同时按运行、实验和演示环境冻结依赖。P08 每次全量复跑保留输入清单、代码版本、参数、时间范围和 Spark 应用 ID；授课材料、开源软件和提交包的来源登记见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+P02 由万明浩登记节点 OS/架构、JDK 发行版及主版本、Spark/PySpark 精确版本、Python 版本、共享路径、执行器数量与内存。按实装 Spark 选择兼容的 Java/Python，保持驱动与执行器 Python 小版本一致。把实测入口写入 README，冻结运行、实验和演示依赖。P08 全量复跑保存输入清单、代码版本、参数、时间范围和 Spark 应用 ID。
