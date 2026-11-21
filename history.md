@@ -45,3 +45,17 @@
 按课件原名和页码复核了 HDFS、MapReduce、Spark、K-means 与聚类，以及 TF-IDF。集群和分区验收增加 Stage 和 Shuffle 的观测指标。TF-IDF 作为日志文本特征的备选实验。资料位置、课程知识点与实现入口见 [课程资料与查阅路径](technology_stack.md#课程资料与查阅路径)。
 
 在项目目录初始化独立 Git 仓库，初始分支为 `main`。版本基线包含六份团队文档和 `.gitignore`。课件与教师发放的完整原材保留在本地，组员按 README 获取。
+
+<a name="p01-acceptance"></a>
+
+## 2026-11-21 · P01 · 数据接口、共用样本与批次入口验收
+
+阶段主责刘陈昱，开发助手实现并执行本地验收。使用 CPython 3.12.14、PyArrow 25.0.1、165 个运行分片和 92 个仓库 TAR。按 [README](README.md#开发者第一次运行) 解包和复跑，样本保存在项目的 `.local/p01/`，入口为 [ghawtrace.pipeline](ghawtrace/pipeline.py)，自动化验收为 [test_p01.py](tests/test_p01.py)。
+
+| 项目 | 核验步骤与实测结果 |
+|---|---|
+| P01-T01 · 连接约定 | 按 [数据接口](technology_stack.md#表的粒度与分析口径) 复核真实样本。747 个 run 归到 17 个工作流、202 个工作流周，按对应键连接均保留 747 行。直接左连 attempt 会扩到 750 行，按 run 聚合后左连保留 747 个唯一 run。合成用例另验证同一 run 两个 attempt、三个证据行与没有归档的 run。 |
+| P01-T02 · 可复现样本 | 核验单次工作流、跳过、失败、有归档、无归档、多 attempt 六类锚点。跳过与无归档共用一条 run。样本共 747 个 run 和 294 个唯一 attempt。将其中 12 个完整工作流与全量表逐一对账。换输出目录重新生成，ID 清单和两张 Parquet 文件逐字节一致。 |
+| P01-T03 · 输入准备与恢复 | 全量模式读写 4,112,526 个 run，索引 30,427 个 attempt，manifest 记录相对路径、内容 SHA-256、模式、参数和分步行数。同目录重跑样本和全量均返回 `reused: true`。测试在两张表写入后、完成清单写入前强制退出，只有隐藏临时目录。重试成功。两个进程同时写入时只发布一个批次。 |
+
+`python -m unittest discover -s tests -v` 共 5 项通过。全量实测范围为本地输入准备，Spark 多节点作业和数据质量审计由 P02 验收。

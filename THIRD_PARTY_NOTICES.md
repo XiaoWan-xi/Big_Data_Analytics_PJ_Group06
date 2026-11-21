@@ -1,6 +1,6 @@
 # 第三方软件与材料声明
 
-本清单记录第 6 组项目所用的第三方材料、直接依赖和环境工具。当前交付为开发文档及教师提供的原材；仓库尚无依赖锁文件或可分发的软件包。表中“本地实测”只描述 README 双分片示例的环境，“待锁定”由后续实际安装或打包结果回填。各项目的完整版权与许可声明以所用发行版附带的文件为准。
+本清单记录第 6 组项目所用的第三方材料、直接依赖和环境工具。P01 的运行依赖在 [requirements.txt](requirements.txt) 中固定。“本地实测”指已运行的本地示例和验收环境，“待锁定”由后续安装或打包结果回填。各项目的完整版权与许可声明以所用发行版附带的文件为准。
 
 ## 数据集、论文与课程材料
 
@@ -18,7 +18,7 @@
 | 上游项目 / 包 | 使用范围 | 当前版本依据 | 上游主许可证与依据 |
 |---|---|---|---|
 | Apache Spark / PySpark（含 Spark SQL、MLlib） | 分布式清洗、特征、聚类 | 方案选定，待集群定版 | Apache-2.0，发行版还带有组件声明。[LICENSE](https://github.com/apache/spark/blob/master/LICENSE) · [NOTICE](https://github.com/apache/spark/blob/master/NOTICE) |
-| Apache Arrow / pyarrow | 教师脚本、Parquet 读取与写出 | 本地实测 25.0.1，集群待锁定 | Apache-2.0，随附组件许可见文件后部。[LICENSE](https://github.com/apache/arrow/blob/main/LICENSE.txt) |
+| Apache Arrow / pyarrow | 教师脚本与 P01 Parquet 读写 | P01 固定并实测 25.0.1，集群待锁定 | Apache-2.0，随附组件许可见文件后部。[LICENSE](https://github.com/apache/arrow/blob/main/LICENSE.txt) |
 | pandas | 教师读取示例、有限规模的结果表 | 本地实测 2.2.3，集群待锁定 | BSD-3-Clause。[LICENSE](https://github.com/pandas-dev/pandas/blob/main/LICENSE) |
 | DuckDB / duckdb | 教师 SQL 接口、独立复算与结果查询 | 教师脚本已引用，项目版本待锁定 | MIT。[LICENSE](https://github.com/duckdb/duckdb/blob/main/LICENSE) |
 | scikit-learn | ARI、Isolation Forest、联合实验 | 计划引入，待锁定 | BSD-3-Clause。[COPYING](https://github.com/scikit-learn/scikit-learn/blob/main/COPYING) |

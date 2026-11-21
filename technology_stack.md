@@ -30,16 +30,21 @@
 
 ## 表的粒度与分析口径
 
-以下为约定的逻辑表名，物理路径在 P01 配置。原始 runs 的 19 列含字符串时间戳和较大的 `github_metadata_json`，全量主线仅读必要列。
+P01 的 `runs_input.parquet` 投影原始列，保留字符串时间戳、状态和原始空值，供 P02 清洗。原始 `log_*_count` 描述源数据的归档统计。是否在课程子集中找到 ZIP，以 `attempt_index.parquet` 为准。P01 用 PyArrow 逐批读写 Parquet。两份输入目录、命令和示例见 [README](README.md)。
 
-| 表 | 唯一键 | 关键字段或约束 |
+下表为 P02–P07 的最小数据约定。各表主键列非空。ID 用 int64，尝试编号用从 1 开始的 int32。路径保留原始文本及大小写。UTC 时间使用 Parquet 微秒时间戳，Spark 会话设为 UTC，周键使用对应的周一日期。
+
+| 粒度与产物 | 唯一键 | 最小字段、单位与空值 |
 |---|---|---|
-| `runs_clean` | `run_id` | 保留 `repo_id`、`workflow_id`、原样 `workflow_path`、UTC 时间、事件、状态、结论与尝试次数；一个 run 只计一次 |
-| `workflow_profile` | `repo_id, workflow_path` | 路径按原值精确匹配；保留 workflow_id 用于一致性检查。画像汇总观测窗口内的行为 |
-| `workflow_week` | `repo_id, workflow_path, week_start_utc` | 显式记录完整周、零运行、样本量与观测边界；基线只使用评分时点之前已知的信息 |
-| `attempt_fingerprint` / `run_fingerprint` | 分别为 `run_id, attempt` / `run_id` | 保存结构化解析状态、覆盖与分母；明确采用求和、最大值或按有效行数加权的字段，归并后与 runs 一对一连接 |
-| `log_evidence` | `run_id, attempt, member, line_no` | 带仓库归档位置；每行可有多个信号标签，展示脱敏短摘录。区分整 job 文本与其步骤副本 |
-| 模型结果 | 原型用工作流键；行为/联合分数用 run 键；生命周期用工作流与周/区间 | 保存运行批次、模型/规则版本、基线或对照、分数方向、原因及证据键；跨批查询同时指定批次 |
+| run · `runs_clean` | `run_id` | `repo_id`、`workflow_path`、可空的 `workflow_id`，`created_at_utc` 作为归周时间。缺失或无法解析的创建时间交 P02 隔离。保留可空的 `updated_at_utc`、`event`、`status`、`conclusion`、`run_attempts`。从创建到更新的 `elapsed_seconds` 为浮点秒，更新时间缺失或倒序时记空并纳入质量统计 |
+| 工作流 · `workflow_profile` | `repo_id, workflow_path` | `run_count`、`first_seen_utc`、`last_seen_utc` 和观测窗口。保留可空的 `workflow_id` 作一致性检查，同键多 ID 时报告冲突。计数为非负整数，比例取 0 到 1，未知与零分母记空 |
+| 工作流周 · `workflow_week` | `repo_id, workflow_path, week_start_utc` | 周为 UTC 周一开始的半开七天区间。用 `observation_state` 区分 `complete`、`partial`、`before_first_observation`。全周可观测且无运行时 `run_count=0`，首次观测前为 null，不完整周保留已观测计数与状态 |
+| attempt · `attempt_index`、`attempt_fingerprint` | `run_id, attempt` | 索引含 `repo_id`、输入根目录相对 `tar_path`、TAR 内 `tar_member` 与 ZIP 字节数 `archive_bytes`。指纹保留 `parse_status`（`parsed`、`no_target_member` 或 `failed`）、有效行数 `eligible_lines` 和信号计数。已解析零命中为 0，未能解析的特征为 null |
+| 证据行 · `log_evidence` | `run_id, attempt, member, line_no` | `member` 是 ZIP 内文件名，`line_no` 是解码后原成员从 1 起算的行号，成员和行号不因过滤重排。同一行的多种命中放在其标签列表，展示字段为脱敏摘录 |
+
+用 `repo_id, workflow_path` 把每个 run 连到一条工作流画像。用创建时间在 UTC 得到周一日期后，每个 run 连到一条周记录。按 `run_id, attempt` 从 attempt 连到多条证据时保留归档与成员定位。若输出以 run 为粒度，先把信号从证据归到 attempt、再聚合成每 run 一行的 `run_fingerprint`，随后与 `runs_clean` 左连接。归并时保留归档数、解析成功数和特征分母。无归档的 run 保留主表行，日志特征为空。合并后校验总行数和唯一 run 数等于主表。模型分数、参数和证据键随批次保存。
+
+样本使用各场景最小的 run ID。单次运行基于全表按工作流计数；多 attempt 要求课程包中实际索引到至少两个 ZIP。另加入按工作流键排序最前的 12 个有归档且有 20–150 次观测的工作流的完整记录，输出按 ID 去重。场景可能共用一个 run。批次 ID 由输入文件相对路径、内容 SHA-256、模式及接口和样本规则版本确定。在同一输出根目录先写隐藏临时目录，全部完成后一次性重命名发布。
 
 - **时间。** `updated_at - created_at` 表示从创建到最后更新的观测耗时，可能涵盖等待或重跑。报告标清代理量；精确到某执行阶段的结论须用日志时间戳核验。UTC 小时仅支持 UTC 口径的结论。
 - **结果。** 跳过率取 `skipped / 全部 run`。建议失败率定义为 `failure / (success + failure)`，命名为“成功/失败结论中的失败率”；其余结论另列。分母为零记缺失。重试率取已知尝试次数的 run 中 `run_attempts > 1` 的比例，重跑次数为尝试次数减一；日志里的进程内重试另算。

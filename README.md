@@ -6,7 +6,7 @@
 
 ## 当前可用内容
 
-项目已完成原始数据核验和团队文档基线。现在可以运行下方的双分片示例。集群连通性、环境安装、分析管线及演示系统均待开发。代码入口实现并验证后，将在此补上集群和 Demo 的启动命令。
+项目已完成原始数据核验和 P01 输入准备。共用样本用于集群、特征与日志模块联调。Spark 清洗、特征计算、建模和演示分别由后续阶段实现。
 
 | 根目录中的材料 | 能从中得到什么 |
 |---|---|
@@ -18,7 +18,27 @@
 
 ## 开发者第一次运行
 
-克隆仓库后，从课程发布材料取得原始课件和教师发放的 GH-AWTrace 资料，按上表文件名放回对应位置。原始归档、论文、读取脚本和课程项目 PPT 均作为本地参考材料使用。
+组员可共用已经解包的输入目录和已生成的样本批次。本地自行生成批次时，从课程资料取得两份 RAR，使用 Python 3.11 或更高版本及 `unar` 准备输入。已有 `runs/*.parquet` 和 `logs/*.tar` 的共享目录时，可跳过解包并将 `P01_INPUT` 指向该目录。
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+
+P01_INPUT="$PWD/.local/ghawtrace"
+mkdir -p "$P01_INPUT"
+unar -q -D -o "$P01_INPUT" GHAWTrace_ref/runs.rar
+unar -q -D -o "$P01_INPUT" GHAWTrace_ref/logs.rar
+
+python -m ghawtrace.pipeline --input-root "$P01_INPUT" --output-root .local/p01 --mode sample
+python -m unittest discover -s tests -v
+```
+
+命令返回 `batch_dir` 和 `reused`。已完成批次内含 `runs_input.parquet`、`attempt_index.parquet`、`manifest.json`。样本另含 `sample_manifest.json`，列出覆盖样例、完整工作流和全部入样 run ID。要准备全量输入，将命令中的 `--mode sample` 改为 `--mode full`。已完成同一批次时会复用目录。以非隐藏批次目录中的 `manifest.json` 状态 `success` 为完成依据。
+
+课程输入生成 **747 个 run、294 个 attempt 索引**。做周序列或工作流统计时，用 `cohorts` 中的 **12 个完整工作流**，其余行用于覆盖特定场景。查看日志时按 `tar_path` 找输入根目录下的 TAR，再用 `tar_member` 找 ZIP。合成的边界案例独立存于测试代码，团队样本取自课程原始数据。字段、关联和批次约定见 [表的粒度与分析口径](technology_stack.md#表的粒度与分析口径)。
+
+### 教师脚本双分片抽查（可选）
 
 从本目录执行，适用于带 Python 3 和 `unar` 的 macOS/Linux 环境。先在自己的 Python 虚拟环境中准备 `pyarrow` 和 `pandas`（可用 `python3 -m pip install pyarrow pandas`）。以下操作只把两个分片解到新建的临时目录，适合确认脚本和字段。
 
