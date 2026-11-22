@@ -62,6 +62,13 @@
 - **主责与分支**：万明浩，工作分支 `codex/p02`。
 - **执行方法**：对 `10.176.62.226` ~ `10.176.62.230`（`node1` ~ `node5`）逐台执行系统、CPU/内存/磁盘、Java/Python/Spark/Hadoop、挂载与进程巡检，并在 `node5` 核查跨节点 SSH 连通性、`hdfs dfsadmin -report` 及 Hadoop/Spark 配置目录。
 - **关键结果与发现**：
-  - 五台机器均为 CentOS 7 x86_64、JDK `1.8.0_471`、默认 Python `2.7.5`（无 `python3`/`conda`），`node3` 资源最充裕（8 核 / 15G，可用 ~14G），`node5` 可用内存约 5.7G 且有一套单机 `localhost` HDFS。
+  - 五台机器均为 CentOS 7 x86_64、JDK `1.8.0_471`、默认 Python `2.7.5`（无 `python3`/`conda`），`node3` 资源最充裕（8 核 / 15G，可用 ~14G），`node5` 可用内存约 5.7G 且有一套单机 `localhost` HDFS
   - 各节点 `/opt/spark` 默认软链接不一致（`node1`~`node4` 为 `2.0.0`，`node5` 为 `2.4.8`，且各机均备有 `3.5.7`）；历史上存在多组守护进程残留；五台节点默认均无网络共享挂载，`node3`/`node4` 的 `/home` 剩余约 6.1G。
-- **未完成项与下一步**：尚未完成“多节点可读写的数据路径”的打通与实测验证。下一步将配置并验证跨节点共享存储/集群路径，补齐 `P02-T01` 后推进 `P02-T02`（`spark-submit` 多节点分布式作业验证）。
+
+## 2026-11-22｜P02-T01 存储路径验证与部署定版（验收闭环）
+
+- **主责与分支**：万明浩，工作分支 `codex/p02`。
+- **执行方法与证据**：
+  1. 在 `node5` 核查 `nfs-server`、`rpcbind`、`exportfs`、`showmount` 与 `mount.nfs`，确认五台节点均未安装 NFS 服务及客户端工具。
+  2. 在 `node5` 执行 HDFS 读写删全链路实测（`/opt/hadoop/bin/hdfs dfs -mkdir -p /tmp/p02_test` → 写入 `hello_p02_1795359151` → `-cat` 读回校验一致 → `-rm -r -f /tmp/p02_test` 清理），验证 `hdfs://` 路径可正常读写。
+  3. 确定采用 Spark Standalone 模式并显式锁定 `/opt/spark-2.4.8-bin-hadoop2.7`（兼容各节点 JDK `1.8.0_471` 与 Python `2.7.5`），明确 `node3`（8 核 / 15G）为主要 Driver/计算节点、`node5`（`10.176.62.230`）提供 HDFS 与 Master（`spark://10.176.62.230:7077`），其余节点作为计算 Worker，数据统一走 `hdfs://` 路径。

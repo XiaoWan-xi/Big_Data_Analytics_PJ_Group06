@@ -64,4 +64,8 @@ P02 由万明浩登记节点 OS/架构、JDK 发行版及主版本、Spark/PySpa
   - `node3`（`10.176.62.228`）：8 核 / 15G 内存（可用 ~14G）；`/` 50G（可用 30G）、`/home` 48G（可用 6.1G，已用 88%）；`/opt/spark` 指向 `spark-2.0.0-bin-hadoop2.7`，另有 `spark-3.5.7-bin-hadoop3`；运行着 `DataNode`、`NodeManager`；已验证可 SSH 连接。
   - `node4`（`10.176.62.229`）：4 核 / 7.6G 内存（可用 ~1.3G）；`/` 50G（可用 29G）、`/home` 48G（可用 6.1G，已用 88%）；`/opt/spark` 指向 `spark-2.0.0-bin-hadoop2.7`，另有 `spark-3.5.7-bin-hadoop3`；运行着 `DataNode`、`NodeManager`。
   - `node5`（`10.176.62.230`）：4 核 / 7.6G 内存（可用 ~5.7G）；`/` 50G（可用 41G）、`/home` 48G（可用 48G）；`/opt/spark` 指向 `spark-2.4.8-bin-hadoop2.7`，另有 `spark-2.0.0-bin-hadoop2.7`、`spark-3.5.7-bin-hadoop3`；运行着 Spark Standalone `Master`/`Worker`（`spark://10.176.62.230:7077`）及 `NameNode`/`SecondaryNameNode`/`DataNode`（单机 `localhost` HDFS，容量约 49.98GB，可用约 40.89GB）。
-- **拟定部署与角色（待多节点读写路径实测闭环）**：拟采用 Spark Standalone 模式并统一各节点 Spark 版本，由资源较充裕的 `node3`（8 核 / 15G）承担协调/Driver 角色，其余节点承担 Worker 角色（避开 `/home` 已用 88% 的 `node3`/`node4` 存放大量数据）；跨节点可读写数据路径待配置并实测验证。
+- **存储与跨节点可读写路径（已实测）**：五台机器未安装 NFS 工具且无网络挂载，但 `node5`（`10.176.62.230`）运行着可用 HDFS（`Live datanodes (1): node5`，总容量 49.98 GB，可用 40.89 GB）。已在 `node5` 实测 `hdfs dfs -mkdir`、`-put` 写入、`-cat` 读出与 `-rm` 清理闭环，统一采用 **`hdfs://`** 路径（如 `hdfs:///ghawtrace/...`）作为跨节点作业的可读写数据路径（同时避开 `node3`、`node4` 已用 88% 的本地 `/home` 分区）。
+- **选定部署方式与各机角色（P02-T01 定版）**：采用 **Spark Standalone** 模式，显式指定统一发行版 `/opt/spark-2.4.8-bin-hadoop2.7`（避免各机 `/opt/spark` 软链接指向 `2.0.0` 与 `2.4.8` 不一致，同时脚本兼容系统默认的 Python `2.7.5`）。角色划分如下：
+  - **协调 / Driver 提交节点**：`node3`（`10.176.62.228`，8 核 / 15G 内存，可用约 14G），承担作业调度与 Driver 端汇总；
+  - **存储 / Standalone Master & Worker 节点**：`node5`（`10.176.62.230`，4 核 / 7.6G 内存，可用约 5.7G，`/` 可用 41G），承担 HDFS 存储与 Spark Standalone Master（`spark://10.176.62.230:7077`）及 Worker；
+  - **计算 Worker 节点**：`node1`（`10.176.62.226`）、`node2`（`10.176.62.227`）、`node3`（`10.176.62.228`）、`node4`（`10.176.62.229`）按资源余量启动 Worker 接入集群执行分布式任务（至少保证 2 个及以上不同物理节点承担执行器）
