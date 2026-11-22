@@ -56,3 +56,23 @@
 ## 2026-11-21 · P01 · 文档复核
 
 逐一核对六份文档与代码、依赖、测试及版本管理范围。计划的 34 条验收保持原文，课程本地原件用路径标识。重新生成样本和全量批次，校验表结构、行数与复用结果。新旧样本清单和两张表逐字节一致。教师脚本双分片复读 50,000 行，5 项测试通过。
+
+## 2026-11-22 · P03 · 工作流画像、连续周面板与按历史截点特征
+
+阶段主责黄志成，开发助手实现并执行本地验收，待主责与组内复核。输入为 P01 全量批次（165 个分片，4,112,526 个 run）和 747 个 run 的样本批次，另用原始分片目录复跑对照。
+
+复跑入口：`python -m ghawtrace.feature_pipeline --runs-input <P01 批次> --output-root .local/p03`。产物在 `.local/p03/`（全量 `p03-885865…`、样本 `p03-607d48…`）和 `.local/p03-py25/p03-87c047…`（原始分片对照），按 `.gitignore` 不入库。
+
+| 项目 | 实现与实测结果 |
+|---|---|
+| 入口 | [ghawtrace/features.py](ghawtrace/features.py) 实现画像、事件构成、周面板、截点特征和对账；[ghawtrace/feature_pipeline.py](ghawtrace/feature_pipeline.py) 负责批次、`manifest.json`、原子发布与复用。[README](README.md#p03-工作流画像与周特征) 增加命令。 |
+| 指标口径 | 细化见[技术栈](technology_stack.md#表的粒度与分析口径)。事件与小时比例以全部 run 为分母；失败率为 `failure/(success+failure)`；重试率为已知尝试次数中 `run_attempts>1` 的比例；耗时为 `updated_at-created_at`，缺失、倒序或零分母记 null；间隔为同一工作流相邻创建时间差；分位数为精确线性插值；周键为 UTC 周一，采集首末周 `partial`、首个观测周前 `before_first_observation`、其余 `complete`；截点活动特征只看 `created_at<cutoff`，结果特征再看 `updated_at<cutoff`。 |
+| P03-T01 · 手算核验 | [test_p03.py](tests/test_p03.py) 用手算样例覆盖单 run、零分母、缺失更新时间、负耗时、跨年周界与事件/小时熵。4 个 run 的样例工作流：事件比例 0.75/0.25、小时占比 0.5/0.25/0.25、活跃天数 3/8、失败率 1/3、重试率 0.25、耗时中位 150.5 s、p90 510 s、间隔中位 147,600 s，均与手算一致。 |
+| P03-T02 · 画像与对账 | `workflow_profile.parquet` 11,396 行，`run_count` 合计 4,112,526，等于输入行数；`workflow_event_mix.parquet` 15,332 行覆盖 18 个原始事件。1,186 个单 run 工作流，最大 335,985 个 run，中位 26；`failure_rate` 有 1,007 个 null（无 success/failure 结论），1,186 个间隔不可估计，均带标记。全表 `workflow_id` 无同键多值。 |
+| P03-T03 · 周面板 | `workflow_week.parquet` 672,364 行 = 11,396 × 59 周（2025-08-11 至 2026-09-21 的 UTC 周一）。`before_first_observation` 454,827 行计数为 null，`partial` 11,398 行（采集首末周），`complete` 206,139 行，其中 103,433 行为零运行。逐工作流周计数与画像 `run_count` 全部一致。抽查：56,172 次运行的稳定工作流 51 个活跃周；2 次运行的稀疏工作流含 11 个沉寂周；65 次运行的间歇工作流 18 个活跃周、13 段间隔；三者周计数分别合计 56,172、2、65。 |
+| P03-T04 · 截点特征 | `workflow_asof.parquet` 672,364 行（59 个周一截点），`--cutoffs` 支持自定义截点及单工作流范围。测试在截点后追加 run 后重建，旧截点各行逐字段不变；结果可见性用 `updated_at` 约束，截止时点前未完成或更新时间缺失的 run 不计入结果类分母。 |
+| 全量性能 | P01 批次 83.6 MB 输入：读取与规范化 12.3 s、画像 3.8 s、周面板 7.6 s、截点表 20.1 s、对账 2.3 s，CLI 总计 44.8 s；四张产物 2.1/0.2/1.2/6.4 MB。样本批次 17 个工作流、747 个 run，约 3 s。 |
+| 测试与环境 | CPython 3.12.7、PyArrow 16.1.0 与 25.0.1、NumPy 1.26.3、Windows 11 本地；目标仍为集群 Linux，代码无平台相关路径或 shell 调用。`python -m unittest discover -s tests -v` 共 30 项通过（P01 5 项 + P03 25 项）。用 P01 批次和 165 个原始分片分别全量运行，四张表逐表相同。 |
+| 方案变更 | 计划原写 PySpark SQL。P03 依赖的 P02-T03 清洗表尚未落地，而 4.1M 行在单机列式下约 45 秒完成；为使本阶段能在本地按手算样例验收，改用 PyArrow + NumPy，输出仍为 Parquet，P04/P05 的 Spark 作业可直接读取。技术栈已同步，若后续要求集群重算只需替换读取层。 |
+| 修正 | 验收中发现结果类比例在“有可见结果但无 success/failure 结论”时应记 null，最初被写成 NaN；已改为 null，并在批次对账中新增 `no_unmasked_nan` 检查。 |
+| 交付与限制 | P02-T03 清洗表尚未产出，T02 的“对清洗表”对账以 P01 全量 `runs_input` 为基线，P02 完成后按行数复核。小时与深夜结论仅适用于 UTC；耗时是从创建到最后更新的代理量。 |
