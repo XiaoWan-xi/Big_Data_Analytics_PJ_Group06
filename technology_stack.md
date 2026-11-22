@@ -54,3 +54,14 @@ P01 的 `runs_input.parquet` 从 19 个源字段中读取 13 列，保留时间�
 ## 环境定版与复现
 
 P02 由万明浩登记节点 OS/架构、JDK 发行版及主版本、Spark/PySpark 精确版本、Python 版本、共享路径、执行器数量与内存。按实装 Spark 选择兼容的 Java/Python，保持驱动与执行器 Python 小版本一致。把实测入口写入 README，冻结运行、实验和演示依赖。P08 全量复跑保存输入清单、代码版本、参数、时间范围和 Spark 应用 ID。
+
+### 五节点巡检与环境现状（2026-11-22 实测）
+
+- **统一基线**：五台节点（`10.176.62.226` ~ `10.176.62.230`，登录用户 `root`）均为 CentOS Linux 7 (Core) x86_64（内核 `3.10.0-327.el7.x86_64`），均安装 Oracle JDK `1.8.0_471`，系统默认 Python 为 `2.7.5`（暂未发现 `python3` 或 `conda`）；当前各节点均无现成网络共享挂载（`mount` 无 NFS/HDFS 共享挂载）。
+- **节点明细**：
+  - `node1`（`10.176.62.226`）：4 核（Xeon E5649 @ 2.53GHz）/ 7.6G 内存（可用 ~2.0G）；`/` 50G（可用 39G）、`/home` 48G（可用 48G）；`/opt/spark` 指向 `spark-2.0.0-bin-hadoop2.7`，另有 `spark-3.5.7-bin-hadoop3` 与 `/opt/hadoop`；当前无 Hadoop/Spark 守护进程运行。
+  - `node2`（`10.176.62.227`）：4 核 / 7.6G 内存（可用 ~1.1G）；`/` 50G（可用 16G）、`/home` 48G（可用 34G）；`/opt/spark` 指向 `spark-2.0.0-bin-hadoop2.7`，另有 `spark-3.5.7-bin-hadoop3`；运行着 `NameNode`、`SecondaryNameNode`、`ResourceManager`。
+  - `node3`（`10.176.62.228`）：8 核 / 15G 内存（可用 ~14G）；`/` 50G（可用 30G）、`/home` 48G（可用 6.1G，已用 88%）；`/opt/spark` 指向 `spark-2.0.0-bin-hadoop2.7`，另有 `spark-3.5.7-bin-hadoop3`；运行着 `DataNode`、`NodeManager`；已验证可 SSH 连接。
+  - `node4`（`10.176.62.229`）：4 核 / 7.6G 内存（可用 ~1.3G）；`/` 50G（可用 29G）、`/home` 48G（可用 6.1G，已用 88%）；`/opt/spark` 指向 `spark-2.0.0-bin-hadoop2.7`，另有 `spark-3.5.7-bin-hadoop3`；运行着 `DataNode`、`NodeManager`。
+  - `node5`（`10.176.62.230`）：4 核 / 7.6G 内存（可用 ~5.7G）；`/` 50G（可用 41G）、`/home` 48G（可用 48G）；`/opt/spark` 指向 `spark-2.4.8-bin-hadoop2.7`，另有 `spark-2.0.0-bin-hadoop2.7`、`spark-3.5.7-bin-hadoop3`；运行着 Spark Standalone `Master`/`Worker`（`spark://10.176.62.230:7077`）及 `NameNode`/`SecondaryNameNode`/`DataNode`（单机 `localhost` HDFS，容量约 49.98GB，可用约 40.89GB）。
+- **拟定部署与角色（待多节点读写路径实测闭环）**：拟采用 Spark Standalone 模式并统一各节点 Spark 版本，由资源较充裕的 `node3`（8 核 / 15G）承担协调/Driver 角色，其余节点承担 Worker 角色（避开 `/home` 已用 88% 的 `node3`/`node4` 存放大量数据）；跨节点可读写数据路径待配置并实测验证。
