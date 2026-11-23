@@ -76,3 +76,26 @@
 | 方案变更 | 计划原写 PySpark SQL。P03 依赖的 P02-T03 清洗表尚未落地，而 4.1M 行在单机列式下约 45 秒完成；为使本阶段能在本地按手算样例验收，改用 PyArrow + NumPy，输出仍为 Parquet，P04/P05 的 Spark 作业可直接读取。技术栈已同步，若后续要求集群重算只需替换读取层。 |
 | 修正 | 验收中发现结果类比例在“有可见结果但无 success/failure 结论”时应记 null，最初被写成 NaN；已改为 null，并在批次对账中新增 `no_unmasked_nan` 检查。 |
 | 交付与限制 | P02-T03 清洗表尚未产出，T02 的“对清洗表”对账以 P01 全量 `runs_input` 为基线，P02 完成后按行数复核。小时与深夜结论仅适用于 UTC；耗时是从创建到最后更新的代理量。 |
+
+（本节为 2026-11-22 修复前基线；2026-11-23 审核修复后的口径与数字见下节。）
+
+## 2026-11-23 · P03 · 审核意见修复与回归
+
+阶段主责黄志成，开发助手按组内 2026-11-23 审核意见修复并执行本地回归，待主责与组内复核。审核确认 T01 手算指标可验收；T02 已在 P01 全量上验证，正式验收仍需 P02-T03 的 `runs_clean`；T03 的样本观测覆盖和 T04 的截点可见性与范围按下列六项修复。集群全量聚合方案仍待团队确认，本轮交付定位为“P03 本地实现”。
+
+| 审核问题 | 修复与实测结果 |
+|---|---|
+| 1. 样本周面板制造虚假沉寂周 | 读取 `sample_manifest.json` 的 `cohorts`（或 `--sample-manifest` 显式传入），只有完整 cohort 工作流按全量观测处理；其余锚点工作流有 run 的周记 `partial`、无观测的周记 `unknown` 且计数为 null。P01 样本中 5 个非 cohort 工作流原先有 **63** 个错误零运行 `complete` 周，修复后为 **0**；12 个 cohort 的周计数与全量逐周一致，样本状态为 `before_first_observation` 529、`complete` 264、`unknown` 193、`partial` 17。 |
+| 2. 全局截点列出尚未出现的工作流 | 全局截点只为 `created_at < cutoff` 的工作流出评分行；显式 `repo_id`/`workflow_path` 限定的截点保留冷启动行（`has_prior_runs=false`）。全量 `workflow_asof` 从 672,364 行变为 **206,141** 行（59 个周一截点中首个无可见工作流，表中出现 58 个；覆盖 11,377 个工作流），2025-08-11 截点 0 行，`n_prior_runs=0` 的全局行 0；追加一个全新工作流后旧截点键集与数值不变。 |
+| 3. `updated_at` 已到不等于结果已完成 | 已知结果要求 `status=completed`、`conclusion` 非空且 `updated_at < cutoff`；有效耗时与尝试次数也只取 completed 的可见 run；进行中/排队 run 只进入活动类计数与 `open_run_count`，其耗时计入缺失。全量画像 `attempts_known_count` 合计 **4,112,269**、`total_attempts` **4,207,325**、`retried_run_count` **93,891**、`elapsed_known_count` **4,112,269**、`elapsed_missing_count` **257**；最后一个截点 `n_prior_outcomes` 合计 **4,069,017**，与原始数据独立复算的 completed+结论非空+更新时间早于截点一致。新增 completed/skipped + in_progress + queued 的回归用例：活动 3 条、已知结果 1 条、跳过率 1.0、耗时只算 completed。 |
+| 4. 截点范围部分为空被静默扩大 | `load_cutoffs` 与 `build_asof` 逐行校验 `repo_id`/`workflow_path` 同时为空或同时非空；只给路径或只给仓库都抛 `ValueError`，两种部分为空均有回归用例。 |
+| 5. 只发现输入根目录的 `*.parquet` | `resolve_input` 递归发现嵌套 Parquet；读取层用 Hive 分区并保留所需分区列，`runs_clean/year=2026/month=01/part-00000.parquet` 布局已验证；P01 批次仍优先读取 `runs_input.parquet`。 |
+| 6. 批次标识与实际读取的输入可能不一致 | 入口冻结初始文件清单并传给读取层，实际读取只使用冻结清单；发布前重新枚举目录并核对成员、输入文件快照、样本清单哈希和截点文件哈希。新增“执行中新增分片”和“执行中改写截点文件”两个回归用例，均拒绝发布且不留下 `p03-*` 目录。 |
+
+| 项目 | 修复后实测 |
+|---|---|
+| 测试 | `python -m unittest discover -s tests -v` 共 **38** 项通过（P01 5 项 + P03 33 项），覆盖上述六项和原有手算样例。 |
+| 全量运行 | P01 批次 4,112,526 个 run：画像 11,396 行、事件构成 15,332 行、周面板 672,364 行（状态与修复前相同：before 454,827、partial 11,398、complete 206,139，其中零运行 103,433；全量输入无 `unknown`）、截点表 206,141 行；CLI 约 56.6 秒。11 项批次对账全部通过。 |
+| 样本运行 | 747 个 run、17 个工作流：画像 17 行、事件构成 25 行、周面板 1,003 行、截点表按可见工作流缩行；5 个非 cohort 工作流的未观测周为 `unknown`，不再出现虚假零运行。 |
+| 兼容性 | 批次参数 `interface_version` 升为 2，已有 v1 批次不会被误复用；`requirements.txt` 仍为 PyArrow 25.0.1 + NumPy 1.26.3。 |
+| 限制 | 集群全量聚合尚未实现，plan 中保留集群验收项；T02 的 `runs_clean` 对账待 P02-T03；样本数据只用于管线冒烟，不能替代全量验收。小时与深夜结论仅适用于 UTC；耗时仍是创建到最后更新的代理量。 |

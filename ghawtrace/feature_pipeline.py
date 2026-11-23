@@ -67,7 +67,8 @@ def existing_batch(path, batch_id, expected_outputs):
     raise ValueError(f"Output already exists without a valid completed batch: {path}")
 
 
-def prepare_features(runs_input, output_root, cutoff_grid="weekly", cutoffs_path=None):
+def prepare_features(runs_input, output_root, cutoff_grid="weekly", cutoffs_path=None,
+                     sample_manifest=None):
     """Build every P03 table under ``output_root/p03-<hash>`` and publish atomically."""
     runs_input = Path(runs_input).resolve()
     output_root = Path(output_root).resolve()
@@ -80,11 +81,28 @@ def prepare_features(runs_input, output_root, cutoff_grid="weekly", cutoffs_path
     files = resolve_input(runs_input)
     snapshots = {path: file_snapshot(path) for path in files}
     inputs = inventory(runs_input, files)
-    parameters = {"interface_version": 1, "cutoff_grid": cutoff_grid}
+    parameters = {"interface_version": 2, "cutoff_grid": cutoff_grid}
+    sample_path = None
+    if sample_manifest is not None:
+        sample_path = Path(sample_manifest).resolve()
+        if not sample_path.is_file():
+            raise ValueError(f"Sample manifest does not exist: {sample_path}")
+    elif runs_input.is_dir() and (runs_input / "sample_manifest.json").is_file():
+        sample_path = (runs_input / "sample_manifest.json").resolve()
+    sample_snapshot = file_snapshot(sample_path) if sample_path is not None else None
+    if sample_path is not None:
+        parameters["coverage"] = {
+            "path": sample_path.name,
+            "bytes": sample_path.stat().st_size,
+            "sha256": sha256_file(sample_path),
+        }
+    cutoffs_file = None
+    cutoffs_snapshot = None
     if cutoffs_path is not None:
         cutoffs_file = Path(cutoffs_path).resolve()
         if not cutoffs_file.is_file():
             raise ValueError(f"Cutoff table does not exist: {cutoffs_file}")
+        cutoffs_snapshot = file_snapshot(cutoffs_file)
         parameters["cutoffs"] = {
             "path": cutoffs_file.name,
             "bytes": cutoffs_file.stat().st_size,
@@ -101,11 +119,23 @@ def prepare_features(runs_input, output_root, cutoff_grid="weekly", cutoffs_path
         staging = Path(temp)
         tables = build_feature_tables(
             runs_input, cutoff_grid=cutoff_grid if cutoffs_path is None else "none",
-            cutoffs_path=cutoffs_path,
+            cutoffs_path=cutoffs_path, files=files, sample_manifest=sample_path,
         )
+        if resolve_input(runs_input) != files:
+            raise ValueError("Input file set changed during the run. Retry using a stable input directory")
         for path, snapshot in snapshots.items():
             if file_snapshot(path) != snapshot:
                 raise ValueError("Input files changed during the run. Retry using a stable input directory")
+        if sample_path is not None and (
+            file_snapshot(sample_path) != sample_snapshot
+            or sha256_file(sample_path) != parameters["coverage"]["sha256"]
+        ):
+            raise ValueError("Sample manifest changed during the run. Retry using a stable input directory")
+        if cutoffs_file is not None and (
+            file_snapshot(cutoffs_file) != cutoffs_snapshot
+            or sha256_file(cutoffs_file) != parameters["cutoffs"]["sha256"]
+        ):
+            raise ValueError("Cutoff table changed during the run. Retry using a stable cutoff file")
         outputs = {}
         for name, key in (
             (PROFILE_FILE, "workflow_profile"), (EVENT_MIX_FILE, "workflow_event_mix"),
@@ -152,9 +182,13 @@ def main():
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--cutoff-grid", choices=("weekly", "none"), default="weekly")
     parser.add_argument("--cutoffs", type=Path, help="Optional cutoff Parquet with cutoff_id and cutoff_utc")
+    parser.add_argument("--sample-manifest", type=Path,
+                        help="Optional P01 sample_manifest.json; auto-detected in a sample batch directory")
     args = parser.parse_args()
     try:
-        target, reused = prepare_features(args.runs_input, args.output_root, args.cutoff_grid, args.cutoffs)
+        target, reused = prepare_features(
+            args.runs_input, args.output_root, args.cutoff_grid, args.cutoffs, args.sample_manifest,
+        )
     except (OSError, ValueError) as exc:
         parser.exit(1, f"P03: {exc}\n")
     print(json.dumps({"batch_dir": str(target), "reused": reused}, ensure_ascii=False))

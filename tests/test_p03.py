@@ -8,11 +8,13 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from ghawtrace import features
+from ghawtrace import feature_pipeline
 from ghawtrace.feature_pipeline import prepare_features
 
 
@@ -57,6 +59,13 @@ class P03TestBase(unittest.TestCase):
         rows = [row for row in tables["workflow_profile"].to_pylist() if row["workflow_path"].endswith(benchmark)]
         self.assertEqual(len(rows), 1)
         return rows[0]
+
+    def as_of(self, rows, cutoffs_path, name):
+        path = self.write_runs(rows, name)
+        runs = features.read_runs(path)
+        return features.build_asof(
+            runs, features.group_workflows(runs), features.load_cutoffs(cutoffs_path)
+        )
 
 
 class ProfileMetricsTest(P03TestBase):
@@ -422,6 +431,178 @@ class AsOfFeatureTest(P03TestBase):
         self.assertEqual(tables["workflow_asof"].schema, features.ASOF_SCHEMA)
 
 
+class SampleCoverageTest(P03TestBase):
+    """P03-T03: a sample must not invent zero-run weeks for anchor-only workflows."""
+
+    def test_sample_manifest_marks_unobserved_weeks_unknown(self):
+        full_rows = [
+            run(1, "2026-01-05T01:00:00Z", path=".github/workflows/a.yml"),
+            run(2, "2026-01-12T01:00:00Z", path=".github/workflows/a.yml"),
+            run(3, "2026-01-19T01:00:00Z", path=".github/workflows/a.yml"),
+            run(4, "2026-01-05T02:00:00Z", path=".github/workflows/b.yml"),
+            run(5, "2026-01-12T02:00:00Z", path=".github/workflows/b.yml"),
+            run(6, "2026-01-19T02:00:00Z", path=".github/workflows/b.yml"),
+        ]
+        full = features.build_feature_tables(self.write_runs(full_rows, "full.parquet"))
+
+        sample_dir = self.root / "sample"
+        sample_dir.mkdir()
+        sample_rows = full_rows[:4]  # complete cohort a + one anchor run of b
+        pq.write_table(
+            pa.Table.from_pylist(sample_rows, schema=RUN_SCHEMA),
+            sample_dir / "runs_input.parquet",
+        )
+        (sample_dir / "sample_manifest.json").write_text(json.dumps({
+            "source": "provided_inputs",
+            "cohorts": [{
+                "repo_id": 100, "workflow_path": ".github/workflows/a.yml", "run_count": 3,
+            }],
+            "anchors": {},
+            "run_ids": [row["run_id"] for row in sample_rows],
+        }), encoding="utf-8")
+        sample = features.build_feature_tables(sample_dir)
+
+        def weeks(tables, path):
+            return {
+                row["week_start_utc"].isoformat(): row
+                for row in tables["workflow_week"].to_pylist()
+                if row["workflow_path"] == path
+            }
+
+        full_a = weeks(full, ".github/workflows/a.yml")
+        sample_a = weeks(sample, ".github/workflows/a.yml")
+        self.assertEqual(
+            {key: row["run_count"] for key, row in sample_a.items()},
+            {key: row["run_count"] for key, row in full_a.items()},
+        )
+        full_b = weeks(full, ".github/workflows/b.yml")
+        sample_b = weeks(sample, ".github/workflows/b.yml")
+        self.assertEqual(sample_b["2026-01-05"]["observation_state"], "partial")
+        self.assertEqual(sample_b["2026-01-05"]["run_count"], 1)
+        for week in ("2026-01-12", "2026-01-19"):
+            self.assertEqual(sample_b[week]["observation_state"], "unknown")
+            self.assertIsNone(sample_b[week]["run_count"])
+            self.assertEqual(full_b[week]["run_count"], 1)
+        self.assertTrue(sample["checks"]["week_per_workflow_sums"]["ok"])
+        self.assertEqual(sample["coverage"], {(100, ".github/workflows/a.yml")})
+
+
+class GlobalVisibilityTest(P03TestBase):
+    """P03-T04: global cutoffs must not list workflows that do not exist yet."""
+
+    def test_global_cutoff_omits_invisible_workflows(self):
+        cutoffs = self.cutoffs([{"cutoff_id": "c1", "cutoff_utc": "2026-01-10T00:00:00Z"}])
+        old_rows = [run(1, "2026-01-05T01:00:00Z", path=".github/workflows/a.yml")]
+        old = self.as_of(old_rows, cutoffs, "old.parquet")
+        self.assertEqual(
+            [(row["repo_id"], row["workflow_path"]) for row in old.to_pylist()],
+            [(100, ".github/workflows/a.yml")],
+        )
+        self.assertEqual(old.column("n_prior_runs").to_pylist(), [1])
+
+        new_rows = old_rows + [run(2, "2026-02-02T01:00:00Z", path=".github/workflows/b.yml")]
+        new = self.as_of(new_rows, cutoffs, "new.parquet")
+        self.assertEqual(new.to_pylist(), old.to_pylist())
+
+    def test_scoped_cutoff_can_request_cold_start(self):
+        rows = [run(1, "2026-02-02T01:00:00Z", path=".github/workflows/b.yml")]
+        cutoffs = self.cutoffs([{
+            "cutoff_id": "cold", "cutoff_utc": "2026-01-10T00:00:00Z",
+            "repo_id": 100, "workflow_path": ".github/workflows/b.yml",
+        }])
+        table = self.as_of(rows, cutoffs, "cold.parquet")
+        row, = table.to_pylist()
+        self.assertEqual(row["workflow_path"], ".github/workflows/b.yml")
+        self.assertFalse(row["has_prior_runs"])
+        self.assertEqual(row["n_prior_runs"], 0)
+        self.assertIsNone(row["window_start_utc"])
+        self.assertIsNone(row["prior_skip_rate"])
+
+
+class CompletedVisibilityTest(P03TestBase):
+    """P03-T04: updated_at alone does not make an in-progress run a known result."""
+
+    def test_running_runs_are_activity_but_not_outcomes(self):
+        rows = [
+            run(1, "2026-01-05T00:00:00Z", "2026-01-05T00:05:00Z",
+                conclusion="skipped", status="completed", attempts=1),
+            run(2, "2026-01-05T00:01:00Z", "2026-01-05T00:06:00Z",
+                conclusion=None, status="in_progress", attempts=2),
+            run(3, "2026-01-05T00:02:00Z", "2026-01-05T00:07:00Z",
+                conclusion=None, status="queued", attempts=1),
+        ]
+        tables = features.build_feature_tables(self.write_runs(rows, "visibility.parquet"))
+        profile = tables["workflow_profile"].to_pylist()[0]
+        self.assertEqual(profile["run_count"], 3)
+        self.assertEqual(profile["elapsed_known_count"], 1)
+        self.assertEqual(profile["elapsed_missing_count"], 2)
+        self.assertEqual(profile["attempts_known_count"], 1)
+        self.assertEqual(profile["retried_run_count"], 0)
+        self.assertEqual(profile["open_run_count"], 2)
+        self.assertEqual(profile["unknown_conclusion_count"], 2)
+        week = tables["workflow_week"].to_pylist()[0]
+        self.assertAlmostEqual(week["elapsed_median_seconds"], 300.0)
+        self.assertEqual(week["retried_run_count"], 0)
+
+        cutoffs = self.cutoffs([{"cutoff_id": "after", "cutoff_utc": "2026-01-05T00:10:00Z"}])
+        asof = self.as_of(rows, cutoffs, "visibility-asof.parquet").to_pylist()[0]
+        self.assertEqual(asof["n_prior_runs"], 3)
+        self.assertEqual(asof["n_prior_outcomes"], 1)
+        self.assertAlmostEqual(asof["prior_skip_rate"], 1.0)
+        self.assertEqual(asof["n_prior_known_attempts"], 1)
+        self.assertAlmostEqual(asof["prior_retry_rate"], 0.0)
+        self.assertAlmostEqual(asof["prior_elapsed_median_seconds"], 300.0)
+
+
+class CutoffScopeTest(P03TestBase):
+    """P03-T04: repo_id and workflow_path must be either both set or both null."""
+
+    def test_partial_cutoff_scope_is_rejected(self):
+        rows = [run(1, "2026-01-05T01:00:00Z", path=".github/workflows/a.yml")]
+        path = self.write_runs(rows, "scope.parquet")
+        runs = features.read_runs(path)
+        workflows = features.group_workflows(runs)
+        for entry in (
+            {"cutoff_id": "path-only", "cutoff_utc": "2026-01-10T00:00:00Z",
+             "repo_id": None, "workflow_path": ".github/workflows/a.yml"},
+            {"cutoff_id": "repo-only", "cutoff_utc": "2026-01-10T00:00:00Z",
+             "repo_id": 100, "workflow_path": None},
+        ):
+            cutoffs_path = self.cutoffs([entry])
+            with self.assertRaises(ValueError):
+                features.load_cutoffs(cutoffs_path)
+            cutoffs_table = pa.table({
+                "cutoff_id": pa.array([entry["cutoff_id"]], pa.string()),
+                "cutoff_us": pa.array([1768000000000000], pa.int64()),
+                "repo_id": pa.array([entry["repo_id"]], pa.int64()),
+                "workflow_path": pa.array([entry["workflow_path"]], pa.string()),
+            })
+            with self.assertRaises(ValueError):
+                features.build_asof(runs, workflows, cutoffs_table)
+
+
+class PartitionedInputTest(P03TestBase):
+    """P03-T02: nested hive-partitioned Parquet directories are valid input."""
+
+    def test_nested_hive_partitioned_directory(self):
+        root = self.root / "runs_clean"
+        (root / "year=2026" / "month=01").mkdir(parents=True)
+        (root / "year=2026" / "month=02").mkdir(parents=True)
+        pq.write_table(
+            pa.Table.from_pylist([run(1, "2026-01-05T01:00:00Z")], schema=RUN_SCHEMA),
+            root / "year=2026" / "month=01" / "part-0.parquet",
+        )
+        pq.write_table(
+            pa.Table.from_pylist([run(2, "2026-02-02T01:00:00Z")], schema=RUN_SCHEMA),
+            root / "year=2026" / "month=02" / "part-0.parquet",
+        )
+        self.assertEqual(len(features.resolve_input(root)), 2)
+        tables = features.build_feature_tables(root)
+        self.assertEqual(tables["runs"].row_count, 2)
+        self.assertEqual(len(tables["workflow_profile"]), 1)
+        self.assertEqual(int(tables["workflow_profile"].column("run_count").to_numpy().sum()), 2)
+
+
 class PipelineTest(P03TestBase):
     """P03-T02/T03: reproducible batches, reuse and input validation."""
 
@@ -512,6 +693,46 @@ class PipelineTest(P03TestBase):
         self.assertEqual(profile["run_count"], 1)
         self.assertAlmostEqual(profile["elapsed_median_seconds"], 300.0)
         self.assertEqual(profile["first_week_utc"].isoformat(), "2026-01-05")
+
+    def test_input_added_during_run_is_rejected(self):
+        source = self.root / "source"
+        source.mkdir()
+        rows = [run(1, "2026-01-05T01:00:00Z")]
+        pq.write_table(pa.Table.from_pylist(rows, schema=RUN_SCHEMA), source / "part-0.parquet")
+        original = features.build_feature_tables
+
+        def wrapper(*args, **kwargs):
+            pq.write_table(
+                pa.Table.from_pylist([run(2, "2026-01-05T02:00:00Z")], schema=RUN_SCHEMA),
+                source / "part-1.parquet",
+            )
+            return original(*args, **kwargs)
+
+        output = self.root / "output"
+        with patch.object(feature_pipeline, "build_feature_tables", side_effect=wrapper):
+            with self.assertRaises(ValueError) as caught:
+                prepare_features(source, output)
+        self.assertIn("changed", str(caught.exception))
+        self.assertEqual(list(output.glob("p03-*")), [])
+
+    def test_cutoffs_changed_during_run_is_rejected(self):
+        source = self.root / "source"
+        source.mkdir()
+        rows = [run(1, "2026-01-05T01:00:00Z")]
+        pq.write_table(pa.Table.from_pylist(rows, schema=RUN_SCHEMA), source / "part-0.parquet")
+        cutoffs = self.cutoffs([{"cutoff_id": "original", "cutoff_utc": "2026-02-01T00:00:00Z"}])
+        original = features.build_feature_tables
+
+        def wrapper(*args, **kwargs):
+            self.cutoffs([{"cutoff_id": "changed", "cutoff_utc": "2026-02-02T00:00:00Z"}])
+            return original(*args, **kwargs)
+
+        output = self.root / "output"
+        with patch.object(feature_pipeline, "build_feature_tables", side_effect=wrapper):
+            with self.assertRaises(ValueError) as caught:
+                prepare_features(source, output, cutoffs_path=cutoffs)
+        self.assertIn("Cutoff table changed", str(caught.exception))
+        self.assertEqual(list(output.glob("p03-*")), [])
 
 
 if __name__ == "__main__":

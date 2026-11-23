@@ -7,12 +7,13 @@ denominators are fixed here so that P04 (clustering), P05 (run scoring) and P07
 * event, hour and conclusion shares divide by all runs of the workflow.
 * ``skipped_rate`` divides skipped runs by all runs; ``failure_rate`` divides
   failures by ``success + failure`` only and is null when that denominator is 0.
-* ``retry_rate`` divides runs with ``run_attempts > 1`` by runs with a known
-  attempt count; ``total_attempts`` and ``retried_run_count`` keep the counts.
-* ``elapsed_seconds`` is ``updated_at - created_at``.  A run without an update
-  timestamp, or with ``updated_at < created_at``, has a null elapsed value and is
-  counted in ``elapsed_missing_count``; the negative rows are also counted as
-  ``elapsed_negative_count``.
+* ``retry_rate`` divides completed runs with ``run_attempts > 1`` by completed
+  runs with a known attempt count; ``total_attempts`` and ``retried_run_count``
+  keep those counts.  In-progress runs do not have a final attempt count.
+* ``elapsed_seconds`` is ``updated_at - created_at`` for completed runs.  A run
+  without an update timestamp, with ``updated_at < created_at``, or that is not
+  completed has a null elapsed value and is counted in ``elapsed_missing_count``;
+  completed negative rows are also counted as ``elapsed_negative_count``.
 * intervals use the gap between consecutive run creation times of one workflow;
   a single-run workflow has no gap and every interval feature is null with
   ``interval_estimable = false``.
@@ -25,17 +26,24 @@ The weekly panel covers every UTC week from the first to the last week of the
 input.  ``observation_state`` marks the first and last weeks of the input as
 ``partial`` (the collection window truncates them), weeks before the workflow's
 first observed run as ``before_first_observation`` with null counts, and every
-other week as ``complete`` even when ``run_count`` is 0.
+other week as ``complete`` even when ``run_count`` is 0.  For partially observed
+input (a P01 sample), only workflows listed as complete cohorts in
+``sample_manifest.json`` are treated this way; other workflows have observed
+weeks marked ``partial`` and unobserved weeks ``unknown`` with null counts.
 
 The as-of table materialises history features for explicit scoring cutoffs.
-Activity features only use runs created before the cutoff; outcome features
-(skip/failure/retry/elapsed) only use runs whose ``updated_at`` is also before
-the cutoff, i.e. whose result was observable then.  Appending later runs can
-therefore never change an earlier cutoff row.
+Activity features only use runs created before the cutoff.  A known result
+requires the run to be completed, to have a non-null conclusion, and to have
+``updated_at`` before the cutoff; elapsed and attempt features require a
+completed run whose update is visible.  Appending later runs can therefore never
+change an earlier cutoff row.  Global cutoffs only emit workflows already visible
+at the cutoff; explicitly scoped cutoffs may emit a cold-start row with
+``has_prior_runs = false``.
 """
 
 from dataclasses import dataclass
 from datetime import date, timedelta
+import json
 from pathlib import Path
 
 import numpy as np
@@ -71,7 +79,8 @@ PERCENTILES = (50, 90, 99)
 WEEK_STATE_BEFORE = 0
 WEEK_STATE_PARTIAL = 1
 WEEK_STATE_COMPLETE = 2
-WEEK_STATES = ("before_first_observation", "partial", "complete")
+WEEK_STATE_UNKNOWN = 3
+WEEK_STATES = ("before_first_observation", "partial", "complete", "unknown")
 DISPATCH_EVENTS = ("workflow_dispatch", "repository_dispatch")
 
 
@@ -126,11 +135,14 @@ def _lookup(values, known, other_bucket, unknown_bucket):
 
 
 def resolve_input(path):
-    """Expand a P01 batch directory, a Parquet file or a shard directory."""
+    """Expand a P01 batch directory, a partitioned directory or a Parquet file."""
     path = Path(path)
     if path.is_dir():
         batch_file = path / "runs_input.parquet"
-        files = [batch_file] if batch_file.is_file() else sorted(path.glob("*.parquet"))
+        if batch_file.is_file():
+            files = [batch_file]
+        else:
+            files = sorted(file for file in path.rglob("*.parquet") if file.is_file())
     elif path.is_file():
         files = [path]
     else:
@@ -138,6 +150,19 @@ def resolve_input(path):
     if not files:
         raise ValueError(f"No Parquet shards found in {path}")
     return files
+
+
+def _open_dataset(path, files):
+    """Open exactly ``files``; hive partition columns are kept when available."""
+    path = Path(path)
+    base = path if path.is_dir() else path.parent
+    try:
+        return ds.dataset(
+            [str(file) for file in files], format="parquet",
+            partitioning="hive", partition_base_dir=str(base),
+        )
+    except (pa.ArrowInvalid, ValueError):
+        return ds.dataset([str(file) for file in files], format="parquet")
 
 
 @dataclass(frozen=True)
@@ -155,6 +180,8 @@ class RunData:
     attempts: np.ndarray
     has_attempts: np.ndarray
     is_open: np.ndarray
+    is_completed: np.ndarray
+    has_conclusion: np.ndarray
     day: np.ndarray
     week: np.ndarray
     hour: np.ndarray
@@ -187,10 +214,13 @@ class WorkflowIndex:
         return len(self.starts)
 
 
-def read_runs(path):
+def read_runs(path, files=None):
     """Read a run table, validate its keys and return the derived Arrow table."""
-    files = resolve_input(path)
-    dataset = ds.dataset([str(file) for file in files], format="parquet")
+    input_path = Path(path)
+    files = resolve_input(input_path) if files is None else list(files)
+    if not files:
+        raise ValueError(f"No Parquet shards found in {input_path}")
+    dataset = _open_dataset(input_path, files)
     names = set(dataset.schema.names)
     if not {"run_id", "repo_id", "workflow_path"} <= names:
         raise ValueError("Run input must contain run_id, repo_id and workflow_path")
@@ -243,19 +273,25 @@ def normalize_runs(table, created_name="created_at", updated_name="updated_at"):
 
     if "status" in table.column_names:
         status_codes, status_values = _encode(pc.fill_null(table.column("status"), "unknown"))
+        completed_by_value = np.array([value == "completed" for value in status_values])
         open_by_value = np.array([value not in ("completed", "unknown") for value in status_values])
+        is_completed = completed_by_value[status_codes]
         is_open = open_by_value[status_codes]
     else:
+        is_completed = np.ones(len(created_us), bool)
         is_open = np.zeros(len(created_us), bool)
+
+    if "conclusion" in table.column_names:
+        has_conclusion = ~table.column("conclusion").is_null().to_numpy()
+        conclusion_column = pc.fill_null(table.column("conclusion"), "unknown")
+    else:
+        has_conclusion = np.zeros(len(created_us), bool)
+        conclusion_column = pa.chunked_array([pa.array(["unknown"] * len(created_us), pa.string())])
 
     if "event" in table.column_names:
         event_column = pc.fill_null(table.column("event"), "unknown")
     else:
         event_column = pa.chunked_array([pa.array(["unknown"] * len(created_us), pa.string())])
-    if "conclusion" in table.column_names:
-        conclusion_column = pc.fill_null(table.column("conclusion"), "unknown")
-    else:
-        conclusion_column = pa.chunked_array([pa.array(["unknown"] * len(created_us), pa.string())])
 
     day = created_us // US_PER_DAY
     week = day - ((day + 3) % 7)  # 1970-01-01 was a Thursday
@@ -277,6 +313,8 @@ def normalize_runs(table, created_name="created_at", updated_name="updated_at"):
         "attempts": pa.array(attempts, pa.int64()),
         "has_attempts": pa.array(has_attempts, pa.bool_()),
         "is_open": pa.array(is_open, pa.bool_()),
+        "is_completed": pa.array(is_completed, pa.bool_()),
+        "has_conclusion": pa.array(has_conclusion, pa.bool_()),
         "day": pa.array(day, pa.int64()),
         "week": pa.array(week, pa.int64()),
         "hour": pa.array(hour, pa.int8()),
@@ -306,6 +344,8 @@ def _to_run_data(runs):
         attempts=runs.column("attempts").to_numpy(),
         has_attempts=runs.column("has_attempts").to_numpy(),
         is_open=runs.column("is_open").to_numpy(),
+        is_completed=runs.column("is_completed").to_numpy(),
+        has_conclusion=runs.column("has_conclusion").to_numpy(),
         day=runs.column("day").to_numpy(),
         week=runs.column("week").to_numpy(),
         hour=runs.column("hour").to_numpy(),
@@ -516,7 +556,7 @@ def build_profile(runs, workflows):
         success, failure, skipped, cancelled, action_required, startup_failure, other, unknown = conclusions.tolist()
 
         attempts = runs.attempts[run_slice]
-        known_mask = runs.has_attempts[run_slice]
+        known_mask = runs.has_attempts[run_slice] & runs.is_completed[run_slice]
         attempts_known = int(known_mask.sum())
         if attempts_known:
             total_attempts = int(attempts[known_mask].sum())
@@ -527,7 +567,7 @@ def build_profile(runs, workflows):
             max_attempts = None
 
         elapsed = runs.elapsed_us[run_slice]
-        valid_elapsed = elapsed >= 0
+        valid_elapsed = (elapsed >= 0) & runs.is_completed[run_slice]
         elapsed_known = int(valid_elapsed.sum())
         elapsed_seconds = elapsed[valid_elapsed] / US_PER_SECOND
         median, p90, p99 = _percentile_values(elapsed_seconds)
@@ -585,7 +625,9 @@ def build_profile(runs, workflows):
         values["max_attempts"].append(max_attempts)
         values["elapsed_known_count"].append(elapsed_known)
         values["elapsed_missing_count"].append(size - elapsed_known)
-        values["elapsed_negative_count"].append(int(runs.negative_elapsed[run_slice].sum()))
+        values["elapsed_negative_count"].append(
+            int((runs.negative_elapsed[run_slice] & runs.is_completed[run_slice]).sum())
+        )
         values["elapsed_zero_count"].append(elapsed_zero)
         values["elapsed_mean_seconds"].append(elapsed_mean)
         values["elapsed_median_seconds"].append(median)
@@ -691,8 +733,15 @@ def build_profile(runs, workflows):
     return profile, event_mix
 
 
-def build_week_panel(runs, workflows):
-    """Build the dense workflow x UTC-week panel for the global observation window."""
+def build_week_panel(runs, workflows, fully_observed=None):
+    """Build the dense workflow x UTC-week panel for the global observation window.
+
+    ``fully_observed`` is the set of ``(repo_id, workflow_path)`` keys whose input
+    contains every run (full input, or the complete-workflow cohorts of a P01
+    sample).  Other workflows have observed weeks marked ``partial`` and every
+    unobserved week ``unknown`` with null counts, so a sample cannot invent
+    silent weeks that the full data shows as active.
+    """
     count = len(workflows)
     week_base = int(runs.week.min())
     week_max = int(runs.week.max())
@@ -701,6 +750,14 @@ def build_week_panel(runs, workflows):
     conclusion_category = _lookup(
         runs.conclusion_values, CONCLUSIONS, CONCLUSION_OTHER, CONCLUSION_UNKNOWN
     )[runs.conclusion_codes]
+    if fully_observed is None:
+        fully = np.ones(count, bool)
+    else:
+        keys = set(fully_observed)
+        fully = np.array([
+            (int(repo), path) in keys
+            for repo, path in zip(workflows.repo_id.tolist(), workflows.path)
+        ], bool)
 
     run_count = np.zeros(cells, np.int64)
     active_days = np.zeros(cells, np.int32)
@@ -720,18 +777,23 @@ def build_week_panel(runs, workflows):
         conclusions[base:base + n_weeks] = np.bincount(
             flat, minlength=n_weeks * CONCLUSION_BUCKETS
         ).reshape(n_weeks, CONCLUSION_BUCKETS)
-        retry_mask = runs.has_attempts[run_slice] & (runs.attempts[run_slice] > 1)
+        retry_mask = (
+            runs.is_completed[run_slice]
+            & runs.has_attempts[run_slice]
+            & (runs.attempts[run_slice] > 1)
+        )
         retried[base:base + n_weeks] = np.bincount(local[retry_mask], minlength=n_weeks)
         pairs = np.unique(local * 100_000 + runs.day[run_slice])
         active_days[base:base + n_weeks] = np.bincount(
             (pairs // 100_000).astype(np.int64), minlength=n_weeks
         )
         elapsed = runs.elapsed_us[run_slice]
+        completed = runs.is_completed[run_slice]
         segment_starts = np.concatenate(([0], np.flatnonzero(np.diff(local) != 0) + 1))
         segment_ends = np.concatenate((segment_starts[1:], [size]))
         for segment_start, segment_end in zip(segment_starts, segment_ends):
             values = elapsed[segment_start:segment_end]
-            values = values[values >= 0]
+            values = values[(values >= 0) & completed[segment_start:segment_end]]
             if not len(values):
                 continue
             median, p90, _ = _percentile_values(values / US_PER_SECOND)
@@ -745,12 +807,18 @@ def build_week_panel(runs, workflows):
         base = workflow * n_weeks
         first_local = int((workflows.first_week[workflow] - week_base) // 7)
         state[base:base + first_local] = WEEK_STATE_BEFORE
-        if state[base] != WEEK_STATE_BEFORE:
-            state[base] = WEEK_STATE_PARTIAL
-        if state[base + n_weeks - 1] != WEEK_STATE_BEFORE:
-            state[base + n_weeks - 1] = WEEK_STATE_PARTIAL
+        if fully[workflow]:
+            if state[base] != WEEK_STATE_BEFORE:
+                state[base] = WEEK_STATE_PARTIAL
+            if state[base + n_weeks - 1] != WEEK_STATE_BEFORE:
+                state[base + n_weeks - 1] = WEEK_STATE_PARTIAL
+        else:
+            tail = slice(base + first_local, base + n_weeks)
+            state[tail] = np.where(
+                run_count[tail] > 0, WEEK_STATE_PARTIAL, WEEK_STATE_UNKNOWN
+            )
 
-    before = state == WEEK_STATE_BEFORE
+    blank = (state == WEEK_STATE_BEFORE) | (state == WEEK_STATE_UNKNOWN)
     weekday = np.tile(week_base + week_offsets, count)
     paths = np.repeat(np.asarray(workflows.path, dtype=object), n_weeks)
     columns = {
@@ -758,19 +826,19 @@ def build_week_panel(runs, workflows):
         "workflow_path": pa.array(paths.tolist(), pa.string()),
         "week_start_utc": _as_date(weekday),
         "observation_state": pa.array(np.asarray(WEEK_STATES, dtype=object)[state].tolist(), pa.string()),
-        "run_count": pa.array(run_count, pa.int64(), mask=before),
-        "active_day_count": pa.array(active_days, pa.int32(), mask=before),
-        "success_count": pa.array(conclusions[:, 0], pa.int64(), mask=before),
-        "failure_count": pa.array(conclusions[:, 1], pa.int64(), mask=before),
-        "skipped_count": pa.array(conclusions[:, 2], pa.int64(), mask=before),
-        "cancelled_count": pa.array(conclusions[:, 3], pa.int64(), mask=before),
-        "action_required_count": pa.array(conclusions[:, 4], pa.int64(), mask=before),
-        "startup_failure_count": pa.array(conclusions[:, 5], pa.int64(), mask=before),
-        "other_conclusion_count": pa.array(conclusions[:, 6], pa.int64(), mask=before),
-        "unknown_conclusion_count": pa.array(conclusions[:, 7], pa.int64(), mask=before),
-        "retried_run_count": pa.array(retried, pa.int64(), mask=before),
-        "elapsed_median_seconds": _as_float64(elapsed_median, before | np.isnan(elapsed_median)),
-        "elapsed_p90_seconds": _as_float64(elapsed_p90, before | np.isnan(elapsed_p90)),
+        "run_count": pa.array(run_count, pa.int64(), mask=blank),
+        "active_day_count": pa.array(active_days, pa.int32(), mask=blank),
+        "success_count": pa.array(conclusions[:, 0], pa.int64(), mask=blank),
+        "failure_count": pa.array(conclusions[:, 1], pa.int64(), mask=blank),
+        "skipped_count": pa.array(conclusions[:, 2], pa.int64(), mask=blank),
+        "cancelled_count": pa.array(conclusions[:, 3], pa.int64(), mask=blank),
+        "action_required_count": pa.array(conclusions[:, 4], pa.int64(), mask=blank),
+        "startup_failure_count": pa.array(conclusions[:, 5], pa.int64(), mask=blank),
+        "other_conclusion_count": pa.array(conclusions[:, 6], pa.int64(), mask=blank),
+        "unknown_conclusion_count": pa.array(conclusions[:, 7], pa.int64(), mask=blank),
+        "retried_run_count": pa.array(retried, pa.int64(), mask=blank),
+        "elapsed_median_seconds": _as_float64(elapsed_median, blank | np.isnan(elapsed_median)),
+        "elapsed_p90_seconds": _as_float64(elapsed_p90, blank | np.isnan(elapsed_p90)),
     }
     return pa.Table.from_pydict(columns, schema=WEEK_SCHEMA)
 
@@ -790,6 +858,38 @@ def weekly_cutoffs(runs):
         "repo_id": pa.array([None] * len(days), pa.int64()),
         "workflow_path": pa.array([None] * len(days), pa.string()),
     })
+
+
+def load_coverage(path, sample_manifest=None):
+    """Return the fully observed workflow keys and the sample manifest path.
+
+    A P01 sample contains all runs for the 12 cohort workflows but only one
+    anchor run for the workflows used to cover specific cases.  Only the cohort
+    keys can be treated as fully observed when building the weekly panel.
+    """
+    input_path = Path(path)
+    manifest_path = None
+    if sample_manifest is not None:
+        manifest_path = Path(sample_manifest).resolve()
+        if not manifest_path.is_file():
+            raise ValueError(f"Sample manifest does not exist: {manifest_path}")
+    elif input_path.is_dir() and (input_path / "sample_manifest.json").is_file():
+        manifest_path = input_path / "sample_manifest.json"
+    if manifest_path is None:
+        return None, None
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Cannot read sample manifest {manifest_path}: {exc}") from exc
+    cohorts = data.get("cohorts") if isinstance(data, dict) else None
+    if not isinstance(cohorts, list):
+        raise ValueError(f"Sample manifest {manifest_path} has no cohorts list")
+    keys = set()
+    for item in cohorts:
+        if not isinstance(item, dict) or item.get("repo_id") is None or item.get("workflow_path") is None:
+            raise ValueError(f"Invalid cohort entry in {manifest_path}: {item!r}")
+        keys.add((int(item["repo_id"]), str(item["workflow_path"])))
+    return keys, manifest_path
 
 
 def load_cutoffs(path):
@@ -820,6 +920,11 @@ def load_cutoffs(path):
     else:
         repo_column = pa.array([None] * len(ids), pa.int64())
         path_column = pa.array([None] * len(ids), pa.string())
+    for cutoff_id, repo, workflow_path in zip(ids.to_pylist(), repo_column.to_pylist(), path_column.to_pylist()):
+        if (repo is None) != (workflow_path is None):
+            raise ValueError(
+                f"Cutoff {cutoff_id} must set both repo_id and workflow_path or neither"
+            )
     return pa.table({
         "cutoff_id": ids,
         "cutoff_us": cutoff_us,
@@ -828,8 +933,8 @@ def load_cutoffs(path):
     })
 
 
-def _asof_history(created, elapsed, attempts, has_attempts, conclusion_category,
-                  day_changes, gap_starts, k, visible, outcomes):
+def _asof_history(created, elapsed, attempts, conclusion_category,
+                  day_changes, gap_starts, k, final, elapsed_visible, attempts_visible):
     """Return history features for the first ``k`` runs of one workflow."""
     window_start = int(created[0])
     active_days = int(np.searchsorted(day_changes, k, side="left")) + 1
@@ -838,26 +943,27 @@ def _asof_history(created, elapsed, attempts, has_attempts, conclusion_category,
         max_gap = float(gap_starts[k - 2]) / US_PER_SECOND
     else:
         mean_gap = max_gap = None
+    outcomes = int(final.sum())
     if outcomes:
-        counts = np.bincount(conclusion_category[:k][visible], minlength=CONCLUSION_BUCKETS)
+        counts = np.bincount(conclusion_category[:k][final], minlength=CONCLUSION_BUCKETS)
         skip_rate = float(counts[2]) / outcomes
         failure_denominator = int(counts[0]) + int(counts[1])
         failure_rate = float(counts[1]) / failure_denominator if failure_denominator else None
-        known_attempts = has_attempts[:k][visible]
-        known_count = int(known_attempts.sum())
-        if known_count:
-            visible_attempts = attempts[:k][visible]
-            retry_rate = float((visible_attempts[known_attempts] > 1).sum()) / known_count
-        else:
-            retry_rate = None
-        elapsed_seconds = elapsed[:k][visible] / US_PER_SECOND
+    else:
+        skip_rate = failure_rate = None
+    known_count = int(attempts_visible.sum())
+    if known_count:
+        visible_attempts = attempts[:k][attempts_visible]
+        retry_rate = float((visible_attempts > 1).sum()) / known_count
+    else:
+        retry_rate = None
+    if elapsed_visible.any():
+        elapsed_seconds = elapsed[:k][elapsed_visible] / US_PER_SECOND
         elapsed_median = float(np.median(elapsed_seconds))
         elapsed_p90 = float(np.percentile(elapsed_seconds, 90))
         elapsed_max = float(elapsed_seconds.max())
     else:
-        skip_rate = failure_rate = retry_rate = None
         elapsed_median = elapsed_p90 = elapsed_max = None
-        known_count = 0
     return {
         "k": k,
         "outcomes": outcomes,
@@ -876,7 +982,13 @@ def _asof_history(created, elapsed, attempts, has_attempts, conclusion_category,
 
 
 def build_asof(runs, workflows, cutoffs):
-    """Materialise history features at explicit scoring cutoffs."""
+    """Materialise history features at explicit scoring cutoffs.
+
+    Global cutoffs only produce rows for workflows already visible at the
+    cutoff (at least one run created before it).  Explicitly scoped cutoffs are
+    always emitted, so a requested cold start can be inspected with
+    ``has_prior_runs = false``.
+    """
     conclusion_category = _lookup(
         runs.conclusion_values, CONCLUSIONS, CONCLUSION_OTHER, CONCLUSION_UNKNOWN
     )[runs.conclusion_codes]
@@ -884,8 +996,17 @@ def build_asof(runs, workflows, cutoffs):
     cutoff_us = cutoffs.column("cutoff_us").to_numpy()
     scoped_repo = cutoffs.column("repo_id").to_pylist()
     scoped_path = cutoffs.column("workflow_path").to_pylist()
-    global_indexes = np.array([index for index, repo in enumerate(scoped_repo) if repo is None], np.int64)
-    workflow_index = {key: index for index, key in enumerate(zip(workflows.repo_id.tolist(), workflows.path))}
+    for index, (repo, path) in enumerate(zip(scoped_repo, scoped_path)):
+        if (repo is None) != (path is None):
+            raise ValueError(
+                f"Cutoff {cutoff_ids[index]} must set both repo_id and workflow_path or neither"
+            )
+    global_indexes = np.array(
+        [index for index, repo in enumerate(scoped_repo) if repo is None], np.int64
+    )
+    workflow_index = {
+        key: index for index, key in enumerate(zip(workflows.repo_id.tolist(), workflows.path))
+    }
     scoped = {}
     for index, (repo, path) in enumerate(zip(scoped_repo, scoped_path)):
         if repo is None:
@@ -894,14 +1015,29 @@ def build_asof(runs, workflows, cutoffs):
         if key not in workflow_index:
             raise ValueError(f"Cutoff {cutoff_ids[index]} references an unknown workflow: {key}")
         scoped.setdefault(workflow_index[key], []).append(index)
-    total = len(global_indexes) * len(workflows) + sum(len(indexes) for indexes in scoped.values())
+
+    kept = []
+    total = 0
+    for workflow in range(len(workflows)):
+        first_created = int(runs.created_us[workflows.starts[workflow]])
+        scoped_indexes = set(scoped.get(workflow, []))
+        indexes = np.concatenate(
+            (global_indexes, np.asarray(scoped.get(workflow, []), np.int64))
+        ).astype(np.int64)
+        indexes = indexes[np.argsort(cutoff_us[indexes], kind="stable")]
+        selected = [
+            int(index) for index in indexes
+            if index in scoped_indexes or cutoff_us[index] > first_created
+        ]
+        kept.append(selected)
+        total += len(selected)
 
     columns = {
         "repo_id": np.empty(total, np.int64),
         "workflow_path": [],
         "cutoff_id": [],
         "cutoff_us": np.empty(total, np.int64),
-        "window_start": np.empty(total, np.int64),
+        "window_start": np.zeros(total, np.int64),
         "window_days": np.full(total, np.nan, np.float64),
         "n_prior_runs": np.zeros(total, np.int64),
         "n_prior_outcomes": np.zeros(total, np.int64),
@@ -918,7 +1054,7 @@ def build_asof(runs, workflows, cutoffs):
         "max_gap": np.full(total, np.nan, np.float64),
     }
     position = 0
-    for workflow in range(len(workflows)):
+    for workflow, selected in enumerate(kept):
         start = int(workflows.starts[workflow])
         size = int(workflows.sizes[workflow])
         run_slice = slice(start, start + size)
@@ -928,15 +1064,15 @@ def build_asof(runs, workflows, cutoffs):
         elapsed = runs.elapsed_us[run_slice]
         attempts = runs.attempts[run_slice]
         has_attempts = runs.has_attempts[run_slice]
+        completed = runs.is_completed[run_slice]
+        known_conclusion = runs.has_conclusion[run_slice]
         conclusion = conclusion_category[run_slice]
         days = runs.day[run_slice]
         day_changes = np.flatnonzero(np.diff(days) != 0) + 1
         gap_starts = np.maximum.accumulate(np.diff(created)) if size > 1 else np.empty(0, np.int64)
-        workflow_cutoffs = np.concatenate((global_indexes, np.asarray(scoped.get(workflow, []), np.int64))).astype(np.int64)
-        workflow_cutoffs = workflow_cutoffs[np.argsort(cutoff_us[workflow_cutoffs], kind="stable")]
         previous = None
         previous_key = None
-        for index in workflow_cutoffs:
+        for index in selected:
             cutoff = int(cutoff_us[index])
             columns["repo_id"][position] = int(workflows.repo_id[workflow])
             columns["workflow_path"].append(workflows.path[workflow])
@@ -944,13 +1080,18 @@ def build_asof(runs, workflows, cutoffs):
             columns["cutoff_us"][position] = cutoff
             k = int(np.searchsorted(created, cutoff, side="left"))
             if k:
-                visible = has_updated[:k] & (updated[:k] < cutoff) & (elapsed[:k] >= 0)
-                outcomes = int(visible.sum())
-                key = (k, outcomes)
+                updated_visible = has_updated[:k] & (updated[:k] < cutoff)
+                final = completed[:k] & known_conclusion[:k] & updated_visible
+                elapsed_visible = completed[:k] & updated_visible & (elapsed[:k] >= 0)
+                attempts_visible = completed[:k] & updated_visible & has_attempts[:k]
+                key = (
+                    k, int(final.sum()), int(elapsed_visible.sum()),
+                    int(attempts_visible.sum()),
+                )
                 if key != previous_key:
                     previous = _asof_history(
-                        created, elapsed, attempts, has_attempts, conclusion,
-                        day_changes, gap_starts, k, visible, outcomes,
+                        created, elapsed, attempts, conclusion,
+                        day_changes, gap_starts, k, final, elapsed_visible, attempts_visible,
                     )
                     previous_key = key
                 columns["window_start"][position] = previous["window_start"]
@@ -969,11 +1110,10 @@ def build_asof(runs, workflows, cutoffs):
                     if value is not None:
                         columns[name][position] = value
             position += 1
-        if position != total and workflow == len(workflows) - 1:
-            raise AssertionError(f"as-of row budget mismatch: {position} != {total}")
+    if position != total:
+        raise AssertionError(f"as-of row budget mismatch: {position} != {total}")
 
     no_prior = columns["n_prior_runs"] == 0
-    no_outcomes = columns["n_prior_outcomes"] == 0
 
     def missing(name):
         """Null mask for a float column: undefined values are stored as NaN."""
@@ -1001,7 +1141,7 @@ def build_asof(runs, workflows, cutoffs):
         "prior_mean_gap_seconds": _as_float64(columns["mean_gap"], missing("mean_gap")),
         "prior_max_gap_seconds": _as_float64(columns["max_gap"], missing("max_gap")),
         "has_prior_runs": pa.array(~no_prior, pa.bool_()),
-        "has_prior_outcomes": pa.array(~no_outcomes, pa.bool_()),
+        "has_prior_outcomes": pa.array(columns["n_prior_outcomes"] > 0, pa.bool_()),
     }
     return pa.Table.from_pydict(table_columns, schema=ASOF_SCHEMA)
 
@@ -1090,14 +1230,23 @@ def reconcile(runs, workflows, profile, week, asof, n_weeks):
     return checks
 
 
-def build_feature_tables(runs_path, cutoff_grid="weekly", cutoffs_path=None):
+def build_feature_tables(runs_path, cutoff_grid="weekly", cutoffs_path=None,
+                         files=None, sample_manifest=None):
     """Read the run table and build every P03 table with reconciliation."""
-    runs = read_runs(runs_path)
+    runs = read_runs(runs_path, files=files)
     if not runs.row_count:
         raise ValueError("Run input has no rows")
+    coverage, manifest_path = load_coverage(runs_path, sample_manifest)
     workflows = group_workflows(runs)
+    if coverage is not None:
+        known = set(zip(workflows.repo_id.tolist(), workflows.path))
+        missing = coverage - known
+        if missing:
+            raise ValueError(
+                f"Sample manifest lists {len(missing)} workflows missing from the run input"
+            )
     profile, event_mix = build_profile(runs, workflows)
-    week = build_week_panel(runs, workflows)
+    week = build_week_panel(runs, workflows, coverage)
     if cutoffs_path is not None:
         cutoffs = load_cutoffs(cutoffs_path)
     elif cutoff_grid == "weekly":
@@ -1123,5 +1272,7 @@ def build_feature_tables(runs_path, cutoff_grid="weekly", cutoffs_path=None):
         "workflow_asof": asof,
         "cutoffs": cutoffs,
         "weeks": n_weeks,
+        "coverage": coverage,
+        "sample_manifest": manifest_path,
         "checks": checks,
     }
