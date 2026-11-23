@@ -65,10 +65,10 @@
   - 五台机器均为 CentOS 7 x86_64、JDK `1.8.0_471`、默认 Python `2.7.5`（无 `python3`/`conda`），`node3` 资源最充裕（8 核 / 15G，可用 ~14G），`node5` 可用内存约 5.7G 且有一套单机 `localhost` HDFS
   - 各节点 `/opt/spark` 默认软链接不一致（`node1`~`node4` 为 `2.0.0`，`node5` 为 `2.4.8`，且各机均备有 `3.5.7`）；历史上存在多组守护进程残留；五台节点默认均无网络共享挂载，`node3`/`node4` 的 `/home` 剩余约 6.1G。
 
-## 2026-11-22｜P02-T01 存储路径验证与部署定版（验收闭环）
+## 2026-11-22｜P02-T01 存储路径验证与部署定版
 
 - **主责与分支**：万明浩，工作分支 `codex/p02`。
 - **执行方法与证据**：
   1. 在 `node5` 核查 `nfs-server`、`rpcbind`、`exportfs`、`showmount` 与 `mount.nfs`，确认五台节点均未安装 NFS 服务及客户端工具。
   2. 在 `node5` 执行 HDFS 读写删全链路实测（`/opt/hadoop/bin/hdfs dfs -mkdir -p /tmp/p02_test` → 写入 `hello_p02_1795359151` → `-cat` 读回校验一致 → `-rm -r -f /tmp/p02_test` 清理），验证 `hdfs://` 路径可正常读写。
-  3. 确定采用 Spark Standalone 模式并显式锁定 `/opt/spark-2.4.8-bin-hadoop2.7`（兼容各节点 JDK `1.8.0_471` 与 Python `2.7.5`），明确 `node3`（8 核 / 15G）为主要 Driver/计算节点、`node5`（`10.176.62.230`）提供 HDFS 与 Master（`spark://10.176.62.230:7077`），其余节点作为计算 Worker，数据统一走 `hdfs://` 路径。
+  3. 确定采用 Spark Standalone 模式并显式锁定 `/opt/spark-2.4.8-bin-hadoop2.7`（兼容各节点 JDK `1.8.0_471` 与 Python `2.7.5`）。基于五节点资源与现有服务分布，选定 `node3`（8 核 / 15G，可用约 14G，但 `/home` 仅剩 6.1G）作为主要 Driver/计算节点以承担调度与汇总开销、规避本地磁盘瓶颈；`node5`（已有可用 HDFS 且可用内存约 5.7G）承担存储与 Standalone Master（`spark://10.176.62.230:7077`）；`node1`、`node2`、`node4`（4 核 / 7.6G）作为计算 Worker 接入集群，数据统一走 `hdfs://` 路径。
