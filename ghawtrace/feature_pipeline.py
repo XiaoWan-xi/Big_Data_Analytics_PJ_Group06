@@ -81,14 +81,17 @@ def prepare_features(runs_input, output_root, cutoff_grid="weekly", cutoffs_path
     files = resolve_input(runs_input)
     snapshots = {path: file_snapshot(path) for path in files}
     inputs = inventory(runs_input, files)
-    parameters = {"interface_version": 2, "cutoff_grid": cutoff_grid}
+    parameters = {"interface_version": 3, "cutoff_grid": cutoff_grid, "coverage": None}
+    auto_manifest_path = (
+        (runs_input / "sample_manifest.json").resolve() if runs_input.is_dir() else None
+    )
     sample_path = None
     if sample_manifest is not None:
         sample_path = Path(sample_manifest).resolve()
         if not sample_path.is_file():
             raise ValueError(f"Sample manifest does not exist: {sample_path}")
-    elif runs_input.is_dir() and (runs_input / "sample_manifest.json").is_file():
-        sample_path = (runs_input / "sample_manifest.json").resolve()
+    elif auto_manifest_path is not None and auto_manifest_path.is_file():
+        sample_path = auto_manifest_path
     sample_snapshot = file_snapshot(sample_path) if sample_path is not None else None
     if sample_path is not None:
         parameters["coverage"] = {
@@ -120,6 +123,7 @@ def prepare_features(runs_input, output_root, cutoff_grid="weekly", cutoffs_path
         tables = build_feature_tables(
             runs_input, cutoff_grid=cutoff_grid if cutoffs_path is None else "none",
             cutoffs_path=cutoffs_path, files=files, sample_manifest=sample_path,
+            auto_detect_manifest=False,
         )
         if resolve_input(runs_input) != files:
             raise ValueError("Input file set changed during the run. Retry using a stable input directory")
@@ -131,6 +135,10 @@ def prepare_features(runs_input, output_root, cutoff_grid="weekly", cutoffs_path
             or sha256_file(sample_path) != parameters["coverage"]["sha256"]
         ):
             raise ValueError("Sample manifest changed during the run. Retry using a stable input directory")
+        if sample_path is None and auto_manifest_path is not None and auto_manifest_path.exists():
+            raise ValueError(
+                "Sample manifest appeared during the run. Retry using a stable input directory"
+            )
         if cutoffs_file is not None and (
             file_snapshot(cutoffs_file) != cutoffs_snapshot
             or sha256_file(cutoffs_file) != parameters["cutoffs"]["sha256"]

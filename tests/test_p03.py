@@ -486,6 +486,51 @@ class SampleCoverageTest(P03TestBase):
         self.assertTrue(sample["checks"]["week_per_workflow_sums"]["ok"])
         self.assertEqual(sample["coverage"], {(100, ".github/workflows/a.yml")})
 
+    def test_activity_before_anchor_is_unknown(self):
+        full_rows = [
+            run(1, "2026-01-05T01:00:00Z", path=".github/workflows/a.yml"),
+            run(2, "2026-01-12T01:00:00Z", path=".github/workflows/a.yml"),
+            run(3, "2026-01-19T01:00:00Z", path=".github/workflows/a.yml"),
+            run(4, "2026-01-05T02:00:00Z", path=".github/workflows/b.yml"),
+            run(5, "2026-01-12T02:00:00Z", path=".github/workflows/b.yml"),
+            run(6, "2026-01-19T02:00:00Z", path=".github/workflows/b.yml"),
+        ]
+        full = features.build_feature_tables(self.write_runs(full_rows, "anchor-full.parquet"))
+
+        sample_dir = self.root / "anchor-sample"
+        sample_dir.mkdir()
+        sample_rows = full_rows[:3] + [full_rows[4]]  # cohort a + b's middle anchor
+        pq.write_table(
+            pa.Table.from_pylist(sample_rows, schema=RUN_SCHEMA),
+            sample_dir / "runs_input.parquet",
+        )
+        (sample_dir / "sample_manifest.json").write_text(json.dumps({
+            "source": "provided_inputs",
+            "cohorts": [{
+                "repo_id": 100, "workflow_path": ".github/workflows/a.yml", "run_count": 3,
+            }],
+            "anchors": {},
+            "run_ids": [row["run_id"] for row in sample_rows],
+        }), encoding="utf-8")
+        sample = features.build_feature_tables(sample_dir)
+
+        def weeks(tables, path):
+            return {
+                row["week_start_utc"].isoformat(): row
+                for row in tables["workflow_week"].to_pylist()
+                if row["workflow_path"] == path
+            }
+
+        full_b = weeks(full, ".github/workflows/b.yml")
+        sample_b = weeks(sample, ".github/workflows/b.yml")
+        self.assertEqual(full_b["2026-01-05"]["run_count"], 1)
+        self.assertEqual(sample_b["2026-01-05"]["observation_state"], "unknown")
+        self.assertIsNone(sample_b["2026-01-05"]["run_count"])
+        self.assertEqual(sample_b["2026-01-12"]["observation_state"], "partial")
+        self.assertEqual(sample_b["2026-01-12"]["run_count"], 1)
+        self.assertEqual(sample_b["2026-01-19"]["observation_state"], "unknown")
+        self.assertNotIn("before_first_observation", {row["observation_state"] for row in sample_b.values()})
+
 
 class GlobalVisibilityTest(P03TestBase):
     """P03-T04: global cutoffs must not list workflows that do not exist yet."""
@@ -552,6 +597,38 @@ class CompletedVisibilityTest(P03TestBase):
         self.assertEqual(asof["n_prior_known_attempts"], 1)
         self.assertAlmostEqual(asof["prior_retry_rate"], 0.0)
         self.assertAlmostEqual(asof["prior_elapsed_median_seconds"], 300.0)
+
+
+class StatusContractTest(P03TestBase):
+    """Status is required; a null status is unknown, never completed."""
+
+    def test_missing_status_column_is_rejected_and_null_status_is_not_completed(self):
+        schema = pa.schema([field for field in RUN_SCHEMA if field.name != "status"])
+        row = run(1, "2026-01-05T00:00:00Z", "2026-01-05T00:05:00Z",
+                  conclusion="skipped", attempts=1)
+        row.pop("status")
+        missing_path = self.root / "missing-status.parquet"
+        pq.write_table(pa.Table.from_pylist([row], schema=schema), missing_path)
+        with self.assertRaises(ValueError):
+            features.build_feature_tables(missing_path)
+
+        null_rows = [run(1, "2026-01-05T00:00:00Z", "2026-01-05T00:05:00Z",
+                         status=None, conclusion="skipped", attempts=1)]
+        tables = features.build_feature_tables(self.write_runs(null_rows, "null-status.parquet"))
+        profile = tables["workflow_profile"].to_pylist()[0]
+        self.assertEqual(profile["skipped_count"], 1)
+        self.assertEqual(profile["elapsed_known_count"], 0)
+        self.assertEqual(profile["elapsed_missing_count"], 1)
+        self.assertEqual(profile["attempts_known_count"], 0)
+        self.assertEqual(profile["open_run_count"], 0)
+
+        cutoffs = self.cutoffs([{"cutoff_id": "after", "cutoff_utc": "2026-01-05T00:10:00Z"}])
+        asof = self.as_of(null_rows, cutoffs, "null-status-asof.parquet").to_pylist()[0]
+        self.assertEqual(asof["n_prior_runs"], 1)
+        self.assertEqual(asof["n_prior_outcomes"], 0)
+        self.assertIsNone(asof["prior_skip_rate"])
+        self.assertIsNone(asof["prior_elapsed_median_seconds"])
+        self.assertEqual(asof["n_prior_known_attempts"], 0)
 
 
 class CutoffScopeTest(P03TestBase):
@@ -713,6 +790,32 @@ class PipelineTest(P03TestBase):
             with self.assertRaises(ValueError) as caught:
                 prepare_features(source, output)
         self.assertIn("changed", str(caught.exception))
+        self.assertEqual(list(output.glob("p03-*")), [])
+
+    def test_sample_manifest_appearing_during_run_is_rejected(self):
+        source = self.root / "source"
+        source.mkdir()
+        rows = [run(1, "2026-01-05T01:00:00Z")]
+        pq.write_table(pa.Table.from_pylist(rows, schema=RUN_SCHEMA), source / "part-0.parquet")
+        manifest = source / "sample_manifest.json"
+        original = features.build_feature_tables
+
+        def wrapper(*args, **kwargs):
+            manifest.write_text(json.dumps({
+                "source": "provided_inputs",
+                "cohorts": [{
+                    "repo_id": 100, "workflow_path": ".github/workflows/alpha.yml", "run_count": 1,
+                }],
+                "anchors": {},
+                "run_ids": [1],
+            }), encoding="utf-8")
+            return original(*args, **kwargs)
+
+        output = self.root / "output"
+        with patch.object(feature_pipeline, "build_feature_tables", side_effect=wrapper):
+            with self.assertRaises(ValueError) as caught:
+                prepare_features(source, output)
+        self.assertIn("Sample manifest appeared", str(caught.exception))
         self.assertEqual(list(output.glob("p03-*")), [])
 
     def test_cutoffs_changed_during_run_is_rejected(self):

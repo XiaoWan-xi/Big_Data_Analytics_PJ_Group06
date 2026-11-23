@@ -22,6 +22,9 @@ denominators are fixed here so that P04 (clustering), P05 (run scoring) and P07
 * percentiles are exact linear-interpolation percentiles (``numpy.percentile``,
   method ``linear``) over observed values, not approximate quantiles.
 
+``status`` is a required input column.  A missing status column is an error;
+a null status cell is treated as unknown, never as completed.
+
 The weekly panel covers every UTC week from the first to the last week of the
 input.  ``observation_state`` marks the first and last weeks of the input as
 ``partial`` (the collection window truncates them), weeks before the workflow's
@@ -29,7 +32,9 @@ first observed run as ``before_first_observation`` with null counts, and every
 other week as ``complete`` even when ``run_count`` is 0.  For partially observed
 input (a P01 sample), only workflows listed as complete cohorts in
 ``sample_manifest.json`` are treated this way; other workflows have observed
-weeks marked ``partial`` and unobserved weeks ``unknown`` with null counts.
+weeks marked ``partial`` and every unobserved week ``unknown`` with null counts,
+including weeks before their anchor run (the sample cannot establish when they
+first existed).
 
 The as-of table materialises history features for explicit scoring cutoffs.
 Activity features only use runs created before the cutoff.  A known result
@@ -224,6 +229,8 @@ def read_runs(path, files=None):
     names = set(dataset.schema.names)
     if not {"run_id", "repo_id", "workflow_path"} <= names:
         raise ValueError("Run input must contain run_id, repo_id and workflow_path")
+    if "status" not in names:
+        raise ValueError("Run input must contain a status column; missing status cannot be treated as completed")
     created_name = "created_at_utc" if "created_at_utc" in names else "created_at"
     updated_name = "updated_at_utc" if "updated_at_utc" in names else "updated_at"
     if created_name not in names:
@@ -271,15 +278,13 @@ def normalize_runs(table, created_name="created_at", updated_name="updated_at"):
         attempts = np.zeros(len(created_us), np.int64)
         has_attempts = np.zeros(len(created_us), bool)
 
-    if "status" in table.column_names:
-        status_codes, status_values = _encode(pc.fill_null(table.column("status"), "unknown"))
-        completed_by_value = np.array([value == "completed" for value in status_values])
-        open_by_value = np.array([value not in ("completed", "unknown") for value in status_values])
-        is_completed = completed_by_value[status_codes]
-        is_open = open_by_value[status_codes]
-    else:
-        is_completed = np.ones(len(created_us), bool)
-        is_open = np.zeros(len(created_us), bool)
+    if "status" not in table.column_names:
+        raise ValueError("Run input must contain a status column; missing status cannot be treated as completed")
+    status_codes, status_values = _encode(pc.fill_null(table.column("status"), "unknown"))
+    completed_by_value = np.array([value == "completed" for value in status_values])
+    open_by_value = np.array([value not in ("completed", "unknown") for value in status_values])
+    is_completed = completed_by_value[status_codes]
+    is_open = open_by_value[status_codes]
 
     if "conclusion" in table.column_names:
         has_conclusion = ~table.column("conclusion").is_null().to_numpy()
@@ -805,17 +810,19 @@ def build_week_panel(runs, workflows, fully_observed=None):
     week_offsets = np.arange(n_weeks, dtype=np.int64) * 7
     for workflow in range(count):
         base = workflow * n_weeks
-        first_local = int((workflows.first_week[workflow] - week_base) // 7)
-        state[base:base + first_local] = WEEK_STATE_BEFORE
         if fully[workflow]:
+            first_local = int((workflows.first_week[workflow] - week_base) // 7)
+            state[base:base + first_local] = WEEK_STATE_BEFORE
             if state[base] != WEEK_STATE_BEFORE:
                 state[base] = WEEK_STATE_PARTIAL
             if state[base + n_weeks - 1] != WEEK_STATE_BEFORE:
                 state[base + n_weeks - 1] = WEEK_STATE_PARTIAL
         else:
-            tail = slice(base + first_local, base + n_weeks)
-            state[tail] = np.where(
-                run_count[tail] > 0, WEEK_STATE_PARTIAL, WEEK_STATE_UNKNOWN
+            # The sample cannot establish when a non-cohort workflow first
+            # existed: every week without a sampled run is unknown, including
+            # weeks before the anchor run.
+            state[base:base + n_weeks] = np.where(
+                run_count[base:base + n_weeks] > 0, WEEK_STATE_PARTIAL, WEEK_STATE_UNKNOWN
             )
 
     blank = (state == WEEK_STATE_BEFORE) | (state == WEEK_STATE_UNKNOWN)
@@ -860,7 +867,7 @@ def weekly_cutoffs(runs):
     })
 
 
-def load_coverage(path, sample_manifest=None):
+def load_coverage(path, sample_manifest=None, auto_detect=True):
     """Return the fully observed workflow keys and the sample manifest path.
 
     A P01 sample contains all runs for the 12 cohort workflows but only one
@@ -873,7 +880,7 @@ def load_coverage(path, sample_manifest=None):
         manifest_path = Path(sample_manifest).resolve()
         if not manifest_path.is_file():
             raise ValueError(f"Sample manifest does not exist: {manifest_path}")
-    elif input_path.is_dir() and (input_path / "sample_manifest.json").is_file():
+    elif auto_detect and input_path.is_dir() and (input_path / "sample_manifest.json").is_file():
         manifest_path = input_path / "sample_manifest.json"
     if manifest_path is None:
         return None, None
@@ -1231,12 +1238,14 @@ def reconcile(runs, workflows, profile, week, asof, n_weeks):
 
 
 def build_feature_tables(runs_path, cutoff_grid="weekly", cutoffs_path=None,
-                         files=None, sample_manifest=None):
+                         files=None, sample_manifest=None, auto_detect_manifest=True):
     """Read the run table and build every P03 table with reconciliation."""
     runs = read_runs(runs_path, files=files)
     if not runs.row_count:
         raise ValueError("Run input has no rows")
-    coverage, manifest_path = load_coverage(runs_path, sample_manifest)
+    coverage, manifest_path = load_coverage(
+        runs_path, sample_manifest, auto_detect=auto_detect_manifest
+    )
     workflows = group_workflows(runs)
     if coverage is not None:
         known = set(zip(workflows.repo_id.tolist(), workflows.path))
