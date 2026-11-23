@@ -71,4 +71,16 @@
 - **执行方法与证据**：
   1. 在 `node5` 核查 `nfs-server`、`rpcbind`、`exportfs`、`showmount` 与 `mount.nfs`，确认五台节点均未安装 NFS 服务及客户端工具。
   2. 在 `node5` 执行 HDFS 读写删全链路实测（`/opt/hadoop/bin/hdfs dfs -mkdir -p /tmp/p02_test` → 写入 `hello_p02_1795359151` → `-cat` 读回校验一致 → `-rm -r -f /tmp/p02_test` 清理），验证 `hdfs://` 路径可正常读写。
-  3. 确定采用 Spark Standalone 模式并显式锁定 `/opt/spark-2.4.8-bin-hadoop2.7`（兼容各节点 JDK `1.8.0_471` 与 Python `2.7.5`）。基于五节点资源与现有服务分布，选定 `node3`（8 核 / 15G，可用约 14G，但 `/home` 仅剩 6.1G）作为主要 Driver/计算节点以承担调度与汇总开销、规避本地磁盘瓶颈；`node5`（已有可用 HDFS 且可用内存约 5.7G）承担存储与 Standalone Master（`spark://10.176.62.230:7077`）；`node1`、`node2`、`node4`（4 核 / 7.6G）作为计算 Worker 接入集群，数据统一走 `hdfs://` 路径。
+
+## 2026-11-23｜P02-T02 多节点 `spark-submit` 验证闭环与节点角色安排
+  - **节点角色调整原因**：
+    1. 原 T1 草案计划由 `node5` 兼任 Master 与存储、`node3` 作 Driver、`node1/2/4` 作 Worker；实测 `node3`（Spark `2.0.0`）连接 `node5`（Spark `2.4.8`）Master 时因跨版本通信协议不兼容反复报 `java.io.EOFException`。
+    2. 尝试在 `node3` 启动 Spark `2.0.0` Master 时，因 `/opt/spark/conf/spark-env.sh` 预设 `SPARK_MASTER_HOST='10.176.62.226'` 触发 `java.net.BindException: Cannot assign requested address`。
+    3. 最终改由 `node1`（`10.176.62.226`）承担 Spark `2.0.0` Master 与提交端（Driver），`node5` 专注提供 HDFS 存储服务，同版本节点作为 Worker 接入。
+  - **P02-T02 烟雾测试实测证据**：
+    - 提交命令：`spark-submit --master spark://10.176.62.226:7077 --deploy-mode client --conf spark.hadoop.fs.defaultFS=hdfs://10.176.62.230:9000 /tmp/p02_t02_smoke.py ...`
+    - **Application ID**：`app-20261122202423-0003`
+    - **多节点执行器分布**：实测调度至 `10.176.62.228`（`node3`）与 `10.176.62.229`（`node4`）两个不同工作节点。
+    - **读取 → 分组 → 写回结果**：读取 `hdfs://10.176.62.230:9000/tmp/p02_t02_in/sample.tsv`，按 `grp_key` 聚合得到 `alpha (row_cnt=2, val_sum=3)`、`beta (row_cnt=2, val_sum=8)`、`gamma (row_cnt=1, val_sum=4)`；写回 `hdfs://10.176.62.230:9000/tmp/p02_t02_out`，生成 `_SUCCESS` 及 2 个 `.snappy.parquet` 分片文件。
+    - **存储排障记录**：初期使用简写 `hdfs:///...` 时因 `node1` 默认 `fs.defaultFS=hdfs://node1:9000` 触发 `Connection refused` 及 Worker 侧 `UnknownHostException: node1`，通过显式指定完整 `hdfs://10.176.62.230:9000` 路径及 `--conf spark.hadoop.fs.defaultFS=hdfs://10.176.62.230:9000` 解决。
+  - **算力池扩容验证**：在 T2 验收通过后，进一步将同版本 `node2`（`10.176.62.227`，Spark `2.0.0`）作为 Worker 成功注册至 `spark://10.176.62.226:7077`，集群计算池扩展为 `node2`/`node3`/`node4` 共 3 个工作节点，为后续分布式清洗与覆盖率审计预留算力。

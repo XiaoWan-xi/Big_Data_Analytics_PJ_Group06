@@ -55,7 +55,7 @@ P01 的 `runs_input.parquet` 从 19 个源字段中读取 13 列，保留时间�
 
 P02 由万明浩登记节点 OS/架构、JDK 发行版及主版本、Spark/PySpark 精确版本、Python 版本、共享路径、执行器数量与内存。按实装 Spark 选择兼容的 Java/Python，保持驱动与执行器 Python 小版本一致。把实测入口写入 README，冻结运行、实验和演示依赖。P08 全量复跑保存输入清单、代码版本、参数、时间范围和 Spark 应用 ID。
 
-### 五节点巡检与环境现状（2026-11-22 实测）
+### 五节点巡检与环境现状
 
 - **统一基线**：五台节点（`10.176.62.226` ~ `10.176.62.230`，登录用户 `root`）均为 CentOS Linux 7 (Core) x86_64（内核 `3.10.0-327.el7.x86_64`），均安装 Oracle JDK `1.8.0_471`，系统默认 Python 为 `2.7.5`（暂未发现 `python3` 或 `conda`）；当前各节点均无现成网络共享挂载（`mount` 无 NFS/HDFS 共享挂载）。
 - **节点明细**：
@@ -64,14 +64,38 @@ P02 由万明浩登记节点 OS/架构、JDK 发行版及主版本、Spark/PySpa
   - `node3`（`10.176.62.228`）：8 核 / 15G 内存（可用 ~14G）；`/` 50G（可用 30G）、`/home` 48G（可用 6.1G，已用 88%）；`/opt/spark` 指向 `spark-2.0.0-bin-hadoop2.7`，另有 `spark-3.5.7-bin-hadoop3`；运行着 `DataNode`、`NodeManager`；已验证可 SSH 连接。
   - `node4`（`10.176.62.229`）：4 核 / 7.6G 内存（可用 ~1.3G）；`/` 50G（可用 29G）、`/home` 48G（可用 6.1G，已用 88%）；`/opt/spark` 指向 `spark-2.0.0-bin-hadoop2.7`，另有 `spark-3.5.7-bin-hadoop3`；运行着 `DataNode`、`NodeManager`。
   - `node5`（`10.176.62.230`）：4 核 / 7.6G 内存（可用 ~5.7G）；`/` 50G（可用 41G）、`/home` 48G（可用 48G）；`/opt/spark` 指向 `spark-2.4.8-bin-hadoop2.7`，另有 `spark-2.0.0-bin-hadoop2.7`、`spark-3.5.7-bin-hadoop3`；运行着 Spark Standalone `Master`/`Worker`（`spark://10.176.62.230:7077`）及 `NameNode`/`SecondaryNameNode`/`DataNode`（单机 `localhost` HDFS，容量约 49.98GB，可用约 40.89GB）。
-- **存储与跨节点可读写路径（已实测）**：五台机器未安装 NFS 工具且无网络挂载，但 `node5`（`10.176.62.230`）运行着可用 HDFS（`Live datanodes (1): node5`，总容量 49.98 GB，可用 40.89 GB）。已在 `node5` 实测 `hdfs dfs -mkdir`、`-put` 写入、`-cat` 读出与 `-rm` 清理闭环，统一采用 **`hdfs://`** 路径（如 `hdfs:///ghawtrace/...`）作为跨节点作业的可读写数据路径（同时避开 `node3`、`node4` 已用 88% 的本地 `/home` 分区）。
-- **选定部署方式与各机角色（P02-T01 定版）**：采用 **Spark Standalone** 模式，显式指定统一发行版 `/opt/spark-2.4.8-bin-hadoop2.7`（避免各机 `/opt/spark` 软链接指向 `2.0.0` 与 `2.4.8` 不一致，同时脚本兼容系统默认的 Python `2.7.5`）。各机角色划分及实测依据如下：
-  - **协调 / Driver 提交节点：`node3`（`10.176.62.228`）**
-    - **角色**：承担作业提交、全局任务调度以及 Driver 端结果收集汇总（同时可按余量挂载 Worker）。
-    - **安排依据**：五台机器中 `node3` 硬件配置最高（8 核 CPU、15G 内存，当前可用约 14G，其余四台均为 4 核 / 7.6G 内存），最能承受 Driver 在调度分片与汇总结果时的内存开销，避免发生 OOM；同时该节点 `/home` 分区已用 88%（仅剩 6.1G），因此让其发挥计算与调度优势，而将大文件读写统一放到 `hdfs://`，避开本地 `/home` 空间短板。
-  - **存储 / Standalone Master & Worker 节点：`node5`（`10.176.62.230`）**
-    - **角色**：承担 HDFS 数据存储（NameNode / DataNode）以及 Spark Standalone Master（`spark://10.176.62.230:7077`）与 Worker。
-    - **安排依据**：该节点已有运行正常且可读写验证通过的 HDFS 服务（可用容量 40.89 GB），同时本地 `/` 可用 41G、`/home` 可用 48G、内存可用约 5.7G；为避免其同时承担繁重的 Driver 调度而与存储/Master 进程争抢资源，故将其定位为存储与集群控制中心，把主要 Driver 负载交给 `node3`。
-  - **计算 Worker 节点：`node1`（`10.176.62.226`）、`node2`（`10.176.62.227`）、`node4`（`10.176.62.229`）**
-    - **角色**：作为纯计算工作节点（Worker）接入 `spark://10.176.62.230:7077` 分担分布式任务。
-    - **安排依据**：这三台均为 4 核 / 7.6G 内存机型（其中 `node2`、`node4` 另有历史进程占用部分内存，当前可用约 1.1G~1.3G，`node1` 可用约 2.0G 且无历史进程干扰），不适合承担高内存占用的 Driver 或存储主节点，作为计算 Worker 按实际可用内存分配 Executor 更为稳妥；同时注意避开 `node4` 仅剩 6.1G 的 `/home` 分区。
+- **存储与跨节点可读写路径**：五台机器未安装 NFS 工具且无网络挂载，但 `node5`（`10.176.62.230`）运行着可用 HDFS（`Live datanodes (1): node5`，总容量 49.98 GB，可用 40.89 GB）。已在 `node5` 实测 `hdfs dfs -mkdir`、`-put` 写入、`-cat` 读出与 `-rm` 清理闭环，统一采用 **`hdfs://`** 路径（如 `hdfs:///ghawtrace/...`）作为跨节点作业的可读写数据路径（同时避开 `node3`、`node4` 已用 88% 的本地 `/home` 分区）。
+
+### 集群节点角色分工
+
+| 节点 | IP 地址 | 承担角色 | Spark / 存储说明 |
+| :--- | :--- | :--- | :--- |
+| `node1` | `10.176.62.226` | **Spark Master + Driver（提交端）** | Spark `2.0.0` Standalone Master（RPC `7077` / Web UI `8080`），`spark-submit --deploy-mode client` 入口 |
+| `node2` | `10.176.62.227` | **Spark Worker** | Spark `2.0.0`，已成功注册至 `spark://10.176.62.226:7077` |
+| `node3` | `10.176.62.228` | **Spark Worker** | Spark `2.0.0`，已在 P02-T02 烟雾测试中实测承担执行器计算 |
+| `node4` | `10.176.62.229` | **Spark Worker** | Spark `2.0.0`，已在 P02-T02 烟雾测试中实测承担执行器计算 |
+| `node5` | `10.176.62.230` | **HDFS 存储服务节点** | 提供统一存储入口 `hdfs://10.176.62.230:9000` |
+
+### 运行环境与统一存储约定
+- **基础环境**：CentOS 7，Oracle JDK `1.8.0_471`，系统 Python `2.7.5`（`PYSPARK_PYTHON=/usr/bin/python`，PySpark 脚本保持 Python 2.7 兼容语法）。
+- **Spark 路径**：`node1`–`node4` 统一使用 `/opt/spark -> /opt/spark-2.0.0-bin-hadoop2.7`。
+- **统一存储路径**：集群无 NFS 共享挂载，所有分布式读写统一走 `hdfs://10.176.62.230:9000`。因各节点本地 `fs.defaultFS` 配置不一致（如 `node1` 默认指向 `hdfs://node1:9000`），提交作业时**必须显式传入完整 `hdfs://10.176.62.230:9000/...` 路径并附加 `--conf spark.hadoop.fs.defaultFS=hdfs://10.176.62.230:9000`**。
+
+### 常用启停与提交命令
+- **启动 / 停止 Master（`node1`）**：
+  - `/opt/spark/sbin/start-master.sh`
+  - `/opt/spark/sbin/stop-master.sh`
+- **启动 / 停止 Worker（`node2` / `node3` / `node4`）**：
+  - `/opt/spark/sbin/start-slave.sh spark://10.176.62.226:7077`
+  - `/opt/spark/sbin/stop-slave.sh`
+- **标准提交模板（在 `node1` 执行）**：
+  ```bash
+  HDFS_URI="hdfs://10.176.62.230:9000"
+  /opt/spark/bin/spark-submit \
+    --master spark://10.176.62.226:7077 \
+    --deploy-mode client \
+    --conf spark.hadoop.fs.defaultFS="${HDFS_URI}" \
+    <script.py> \
+    "${HDFS_URI}/<input_path>" \
+    "${HDFS_URI}/<output_path>"
+
