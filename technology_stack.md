@@ -99,5 +99,7 @@ P02 由万明浩登记节点 OS/架构、JDK 发行版及主版本、Spark/PySpa
     "${HDFS_URI}/<input_path>" \
     "${HDFS_URI}/<output_path>"
 
-- **Parquet 兼容性与时区约定**：Spark `2.0.0` 不支持新版 `pyarrow` 默认的 `ZSTD` 压缩编解码；原始 Parquet 分片需先按 P01 `RUN_INPUT_SCHEMA`（13 列，裁除 `github_metadata_json`）无损转为 `Parquet 1.0 + Snappy` 格式再上传 HDFS（`hdfs://10.176.62.230:9000/data/ghawtrace/runs_snappy`）。涉及 UTC 时间解析的作业，提交时必须附加 `--conf "spark.driver.extraJavaOptions=-Duser.timezone=UTC"` 与 `--conf "spark.executor.extraJavaOptions=-Duser.timezone=UTC"`。
+- **Parquet 兼容性与时区约定**：Spark `2.0.0` 不支持新版 `pyarrow` 默认的 `ZSTD` 压缩编解码；原始 Parquet 分片需先按 P01 `RUN_INPUT_SCHEMA`（13 列，裁除 `github_metadata_json`）无损转为 `Parquet 1.0 + Snappy` 格式再上传 HDFS（`hdfs://10.176.62.230:9000/data/ghawtrace/runs_snappy`）。涉及 UTC 时间解析的作业，提交时必须附加 `--conf "spark.driver.extraJavaOptions=-Duser.timezone=UTC"` 与 `--conf "spark.executor.extraJavaOptions=-Duser.timezone=UTC"`
+
+- **推荐分区与资源配置**：在 3 台 Worker 节点（实测分配 8 个 Executor × 2 核 / 1536m，总计 16 核）基线下，常规全量聚合分析统一使用 `--conf spark.sql.shuffle.partitions=24`（较默认 `200` 提速 27.6%、HDFS 输出小文件减少 88% 且零溢写）
 

@@ -1,0 +1,143 @@
+{
+  "application_id": "app-20261123195405-0008", 
+  "input_path": "hdfs://10.176.62.230:9000/data/ghawtrace/p02_t03_run1/runs_clean", 
+  "label": "cfgA_p200", 
+  "output_path": "hdfs://10.176.62.230:9000/data/ghawtrace/p02_t05_out_p200", 
+  "output_verification": {
+    "output_content_sha256": "b9f0191f90f927ed87145432569e258c60678f62939069c74e5b55c9161ead3f", 
+    "output_rows": 10246, 
+    "sum_duration_sec": 71829545485, 
+    "sum_nonempty_log_runs": 561366, 
+    "sum_run_cnt": 4112269
+  }, 
+  "partitions": {
+    "input_partitions": 18, 
+    "output_partitions": 200, 
+    "spark_sql_shuffle_partitions": 200
+  }, 
+  "resources": {
+    "executor_cores_conf": "2", 
+    "executor_memory_conf": "1536m", 
+    "worker_executors": [
+      {
+        "completed_tasks": 2, 
+        "host_port": "10.176.62.228:36519", 
+        "id": "2", 
+        "max_memory": 670354636, 
+        "total_cores": 2
+      }, 
+      {
+        "completed_tasks": 99, 
+        "host_port": "10.176.62.227:33087", 
+        "id": "5", 
+        "max_memory": 670354636, 
+        "total_cores": 2
+      }, 
+      {
+        "completed_tasks": 2, 
+        "host_port": "10.176.62.229:45468", 
+        "id": "7", 
+        "max_memory": 670354636, 
+        "total_cores": 2
+      }, 
+      {
+        "completed_tasks": 2, 
+        "host_port": "10.176.62.228:52399", 
+        "id": "1", 
+        "max_memory": 670354636, 
+        "total_cores": 2
+      }, 
+      {
+        "completed_tasks": 106, 
+        "host_port": "10.176.62.227:49683", 
+        "id": "4", 
+        "max_memory": 670354636, 
+        "total_cores": 2
+      }, 
+      {
+        "completed_tasks": 3, 
+        "host_port": "10.176.62.229:42712", 
+        "id": "6", 
+        "max_memory": 670354636, 
+        "total_cores": 2
+      }, 
+      {
+        "completed_tasks": 2, 
+        "host_port": "10.176.62.228:39590", 
+        "id": "0", 
+        "max_memory": 670354636, 
+        "total_cores": 2
+      }, 
+      {
+        "completed_tasks": 3, 
+        "host_port": "10.176.62.228:39134", 
+        "id": "3", 
+        "max_memory": 670354636, 
+        "total_cores": 2
+      }
+    ]
+  }, 
+  "stage_and_shuffle_totals": {
+    "disk_bytes_spilled": 0, 
+    "executor_run_time_ms": 107660, 
+    "input_bytes": 3600762, 
+    "input_records": 4112269, 
+    "memory_bytes_spilled": 0, 
+    "output_bytes": 0, 
+    "output_records": 0, 
+    "shuffle_read_bytes": 3894637, 
+    "shuffle_read_records": 89631, 
+    "shuffle_write_bytes": 3894637, 
+    "shuffle_write_records": 89631, 
+    "stage_count": 3, 
+    "total_tasks": 219
+  }, 
+  "stages": [
+    {
+      "disk_bytes_spilled": 0, 
+      "executor_run_time_ms": 3789, 
+      "input_bytes": 0, 
+      "memory_bytes_spilled": 0, 
+      "name": "parquet at NativeMethodAccessorImpl.java:-2", 
+      "num_tasks": 1, 
+      "output_bytes": 0, 
+      "shuffle_read_bytes": 0, 
+      "shuffle_read_records": 0, 
+      "shuffle_write_bytes": 0, 
+      "shuffle_write_records": 0, 
+      "stage_id": 0
+    }, 
+    {
+      "disk_bytes_spilled": 0, 
+      "executor_run_time_ms": 62771, 
+      "input_bytes": 3600762, 
+      "memory_bytes_spilled": 0, 
+      "name": "parquet at NativeMethodAccessorImpl.java:-2", 
+      "num_tasks": 18, 
+      "output_bytes": 0, 
+      "shuffle_read_bytes": 0, 
+      "shuffle_read_records": 0, 
+      "shuffle_write_bytes": 3894637, 
+      "shuffle_write_records": 89631, 
+      "stage_id": 1
+    }, 
+    {
+      "disk_bytes_spilled": 0, 
+      "executor_run_time_ms": 41100, 
+      "input_bytes": 0, 
+      "memory_bytes_spilled": 0, 
+      "name": "parquet at NativeMethodAccessorImpl.java:-2", 
+      "num_tasks": 200, 
+      "output_bytes": 0, 
+      "shuffle_read_bytes": 3894637, 
+      "shuffle_read_records": 89631, 
+      "shuffle_write_bytes": 0, 
+      "shuffle_write_records": 0, 
+      "stage_id": 2
+    }
+  ], 
+  "timing": {
+    "job_wall_time_sec": 33.029, 
+    "sum_executor_run_time_ms": 107660
+  }
+}
