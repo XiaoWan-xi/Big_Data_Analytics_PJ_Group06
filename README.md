@@ -40,6 +40,48 @@ python -m unittest discover -s tests -v
 - 课程样本有 **747 个 run 与 294 个 attempt 索引**。`sample_manifest.json` 列出 run ID、六类样例和 `cohorts` 中的 12 个完整工作流。做周序列或工作流统计时用这 12 个工作流。合成边界案例在测试中单独生成。
 - `runs_input.parquet` 保留原始列投影，`attempt_index.parquet` 通过 `tar_path` 和 `tar_member` 定位源 TAR 与 ZIP。同一批次满足完成条件时会复用。[数据与批次约定](technology_stack.md#表的粒度与分析口径)
 
+### Parquet转码
+> python3
+python ./ghawtrace/convert_for_spark2.py <input_dir> <output_dir>[limit] [--clean-output]
+<input_dir>：输入 Parquet 分片目录。
+<output_dir>：输出目录。
+[limit]：可选，只转换排序后的前 N 个分片，必须是正整数。
+[--clean-output]：可选，如果输出目录非空，先清空输出目录再写入。
+
+### 集群提交(集群端python2.7.5)
+``` bash
+ssh root@10.176.62.226
+
+HDFS_URI="hdfs://10.176.62.230:9000"
+/opt/spark/bin/spark-submit \
+  --master spark://10.176.62.226:7077 \
+  --deploy-mode client \
+  --conf spark.hadoop.fs.defaultFS="${HDFS_URI}" \
+  --conf "spark.driver.extraJavaOptions=-Duser.timezone=UTC" \
+  --conf "spark.executor.extraJavaOptions=-Duser.timezone=UTC" \
+  --executor-cores 2 \
+  --executor-memory 1536m \
+  --conf spark.sql.shuffle.partitions=36 \
+  "${APP_SCRIPT}" \
+  "${HDFS_URI}/${INPUT_PATH}" \
+  "${HDFS_URI}/${OUTPUT_PATH}" \
+  "${REPORT_OUTPUT_PATH}" 2>&1 | tee "${LOG_PATH}"
+
+```
+### 烟雾测试
+``` bash
+ssh root@10.176.62.226
+
+/opt/spark/bin/spark-submit \
+  --master spark://10.176.62.226:7077 \
+  --deploy-mode client \
+  /tmp/p02_t02_smoke.py \
+  hdfs:///tmp/p02_t02_in/sample.tsv \
+  hdfs:///tmp/p02_t02_out | tee /tmp/p02_t02_run.log
+
+```
+
+
 ### 教师脚本双分片抽查（可选）
 
 在 macOS/Linux 的项目虚拟环境中安装 `pyarrow` 和 `pandas`，用 `unar` 解出两个分片抽查。仅需教师脚本和 `runs.rar`。

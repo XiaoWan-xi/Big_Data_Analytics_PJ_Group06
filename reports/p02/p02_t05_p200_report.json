@@ -1,14 +1,16 @@
 {
-  "application_id": "app-20261123195405-0008", 
+  "application_id": "app-20261124223107-0018", 
+  "evidence_complete": true, 
   "input_path": "hdfs://10.176.62.230:9000/data/ghawtrace/p02_t03_run1/runs_clean", 
   "label": "cfgA_p200", 
   "output_path": "hdfs://10.176.62.230:9000/data/ghawtrace/p02_t05_out_p200", 
   "output_verification": {
-    "output_content_sha256": "b9f0191f90f927ed87145432569e258c60678f62939069c74e5b55c9161ead3f", 
-    "output_rows": 10246, 
-    "sum_duration_sec": 71829545485, 
-    "sum_nonempty_log_runs": 561366, 
-    "sum_run_cnt": 4112269
+    "output_content_sha256": "c9dfdb710b81664a2c3176aa118eb5d4db4035c3de6763df75813f3754acf2d8", 
+    "output_rows": 10302, 
+    "sum_duration_sec": 71835442134, 
+    "sum_elapsed_seconds": 71835442134.0, 
+    "sum_nonempty_log_runs": 561367, 
+    "sum_run_cnt": 4112526
   }, 
   "partitions": {
     "input_partitions": 18, 
@@ -20,57 +22,57 @@
     "executor_memory_conf": "1536m", 
     "worker_executors": [
       {
-        "completed_tasks": 2, 
-        "host_port": "10.176.62.228:36519", 
+        "completed_tasks": 57, 
+        "host_port": "10.176.62.228:39955", 
         "id": "2", 
         "max_memory": 670354636, 
         "total_cores": 2
       }, 
       {
-        "completed_tasks": 99, 
-        "host_port": "10.176.62.227:33087", 
+        "completed_tasks": 2, 
+        "host_port": "10.176.62.227:44287", 
         "id": "5", 
         "max_memory": 670354636, 
         "total_cores": 2
       }, 
       {
         "completed_tasks": 2, 
-        "host_port": "10.176.62.229:45468", 
+        "host_port": "10.176.62.229:37748", 
         "id": "7", 
         "max_memory": 670354636, 
         "total_cores": 2
       }, 
       {
-        "completed_tasks": 2, 
-        "host_port": "10.176.62.228:52399", 
+        "completed_tasks": 49, 
+        "host_port": "10.176.62.228:47504", 
         "id": "1", 
         "max_memory": 670354636, 
         "total_cores": 2
       }, 
       {
-        "completed_tasks": 106, 
-        "host_port": "10.176.62.227:49683", 
+        "completed_tasks": 3, 
+        "host_port": "10.176.62.227:44473", 
         "id": "4", 
         "max_memory": 670354636, 
         "total_cores": 2
       }, 
       {
-        "completed_tasks": 3, 
-        "host_port": "10.176.62.229:42712", 
+        "completed_tasks": 2, 
+        "host_port": "10.176.62.229:35026", 
         "id": "6", 
         "max_memory": 670354636, 
         "total_cores": 2
       }, 
       {
-        "completed_tasks": 2, 
-        "host_port": "10.176.62.228:39590", 
+        "completed_tasks": 50, 
+        "host_port": "10.176.62.228:43112", 
         "id": "0", 
         "max_memory": 670354636, 
         "total_cores": 2
       }, 
       {
-        "completed_tasks": 3, 
-        "host_port": "10.176.62.228:39134", 
+        "completed_tasks": 54, 
+        "host_port": "10.176.62.228:33516", 
         "id": "3", 
         "max_memory": 670354636, 
         "total_cores": 2
@@ -79,23 +81,23 @@
   }, 
   "stage_and_shuffle_totals": {
     "disk_bytes_spilled": 0, 
-    "executor_run_time_ms": 107660, 
-    "input_bytes": 3600762, 
-    "input_records": 4112269, 
+    "executor_run_time_ms": 106392, 
+    "input_bytes": 3527570, 
+    "input_records": 4112526, 
     "memory_bytes_spilled": 0, 
     "output_bytes": 0, 
     "output_records": 0, 
-    "shuffle_read_bytes": 3894637, 
-    "shuffle_read_records": 89631, 
-    "shuffle_write_bytes": 3894637, 
-    "shuffle_write_records": 89631, 
+    "shuffle_read_bytes": 3751208, 
+    "shuffle_read_records": 89769, 
+    "shuffle_write_bytes": 3751208, 
+    "shuffle_write_records": 89769, 
     "stage_count": 3, 
     "total_tasks": 219
   }, 
   "stages": [
     {
       "disk_bytes_spilled": 0, 
-      "executor_run_time_ms": 3789, 
+      "executor_run_time_ms": 2664, 
       "input_bytes": 0, 
       "memory_bytes_spilled": 0, 
       "name": "parquet at NativeMethodAccessorImpl.java:-2", 
@@ -105,39 +107,49 @@
       "shuffle_read_records": 0, 
       "shuffle_write_bytes": 0, 
       "shuffle_write_records": 0, 
-      "stage_id": 0
+      "stage_id": 0, 
+      "task_cumulative_execution_time_ms": 2664
     }, 
     {
       "disk_bytes_spilled": 0, 
-      "executor_run_time_ms": 62771, 
-      "input_bytes": 3600762, 
+      "executor_run_time_ms": 60178, 
+      "input_bytes": 3527570, 
       "memory_bytes_spilled": 0, 
       "name": "parquet at NativeMethodAccessorImpl.java:-2", 
       "num_tasks": 18, 
       "output_bytes": 0, 
       "shuffle_read_bytes": 0, 
       "shuffle_read_records": 0, 
-      "shuffle_write_bytes": 3894637, 
-      "shuffle_write_records": 89631, 
-      "stage_id": 1
+      "shuffle_write_bytes": 3751208, 
+      "shuffle_write_records": 89769, 
+      "stage_id": 1, 
+      "task_cumulative_execution_time_ms": 60178
     }, 
     {
       "disk_bytes_spilled": 0, 
-      "executor_run_time_ms": 41100, 
+      "executor_run_time_ms": 43550, 
       "input_bytes": 0, 
       "memory_bytes_spilled": 0, 
       "name": "parquet at NativeMethodAccessorImpl.java:-2", 
       "num_tasks": 200, 
       "output_bytes": 0, 
-      "shuffle_read_bytes": 3894637, 
-      "shuffle_read_records": 89631, 
+      "shuffle_read_bytes": 3751208, 
+      "shuffle_read_records": 89769, 
       "shuffle_write_bytes": 0, 
       "shuffle_write_records": 0, 
-      "stage_id": 2
+      "stage_id": 2, 
+      "task_cumulative_execution_time_ms": 43550
     }
   ], 
+  "telemetry_status": {
+    "errors": [], 
+    "executors_available": true, 
+    "stages_available": true
+  }, 
   "timing": {
-    "job_wall_time_sec": 33.029, 
-    "sum_executor_run_time_ms": 107660
-  }
+    "job_wall_time_sec": 26.678, 
+    "sum_executor_run_time_ms": 106392, 
+    "task_cumulative_execution_time_ms": 106392
+  }, 
+  "valid_for_t05_acceptance": true
 }

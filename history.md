@@ -102,3 +102,17 @@
     - **配置 A（`p=200`，`app-20261123195405-0008`）**：输入 `18` / 输出 `200` 分片（HDFS 200 个 Parquet 文件），耗时 `33.029 s`（Executor 累计 `107,660 ms`），`3` Stage / `219` Task，Shuffle 读写各 `3,894,637 B`（`89,631` 条），Spill `0 B`。
     - **配置 B（`p=24`，`app-20261123195451-0009`）**：输入 `18` / 输出 `24` 分片（HDFS 24 个 Parquet 文件），耗时 `23.906 s`（Executor 累计 `68,385 ms`），`3` Stage / `43` Task，Shuffle 读写各 `3,132,793 B`（`89,631` 条），Spill `0 B`。
   - **一致性与选型结论**：两组配置输出均为 `10,246` 行（`sum_run_cnt=4,112,269`、`sum_duration_sec=71,829,545,485`、`sum_nonempty_log_runs=561,366`），逐行内容 SHA-256 完全一致（`b9f0191f90f927ed87145432569e258c60678f62939069c74e5b55c9161ead3f`）。最终选定 `spark.sql.shuffle.partitions=24`：端到端提速 27.6%、CPU 时间降 36.5%、Task 数降 80.4%、Shuffle 字节降 19.6%、输出小文件降 88% 且无溢写（报告：[p200_report](reports/p02/p02_t05_p200_report.json)、[p24_report](reports/p02/p02_t05_p24_report.json)）。
+
+## 2026-11-25 p02修改以及补充测试
+1. **本地回归测试（`tests/test_p02_regression.py`）**
+   - 覆盖 `convert_for_spark2.py` 路径隔离/同径拒绝/`limit=1` 样本隔离与源文件 SHA-256 保持、`clean_runs.py` 跨秒亚秒精度与反转时间处理、`partition_bench.py` 遥测失败空值标记等场景；本地无 PySpark 桩环境下通过（`skipped=1` 为真实 PySpark 端到端用例，已由集群实测覆盖）。
+
+2. **集群双份全量清洗（`t03`，Spark 2.0.0，8 Executors × 2 Cores / 1536m）**
+   - 输入：`hdfs://10.176.62.230:9000/data/ghawtrace/runs_snappy`（`4,112,526` 行）。
+   - `run1`（`0016`）与 `run2`（`0017`）均满足 `reconciled_equals_input: true`、`retained_rows: 4,112,526`、`total_quarantined_rows: 0`、`retained_unfinished_runs: 257`（`queued: 176, pending: 73, in_progress: 8`）、`sum_duration_sec: 71835442134`、`sum_elapsed_seconds: 71835442134.0`，两次结果完全一致。
+
+3. **同一清洗底表分区压测（`t05`，输入 `p02_t03_run1/runs_clean`）**
+   - `cfgA_p200`（`0018`，`shuffle.partitions=200`）：耗时 `26.678s`，总任务 `219`，累计 Executor 运行时间 `106,392 ms`，Shuffle 读写 `3,751,208` bytes。
+   - `cfgB_p24`（`0019`，`shuffle.partitions=24`）：耗时 `21.387s`，总任务 `43`，累计 Executor 运行时间 `66,126 ms`，Shuffle 读写 `2,948,664` bytes。
+   - 两档配置产出 `10,302` 行且聚合内容哈希一致（`c9dfdb710b81664a2c3176aa118eb5d4db4035c3de6763df75813f3754acf2d8`）；`p=24` 端到端耗时减少约 `19.8%`，累计 Executor 运行时间减少约 `37.8%`。
+4. 在[README](README.md)中添加了转换Parquet格式、集群提交、烟雾测试的指令入口
