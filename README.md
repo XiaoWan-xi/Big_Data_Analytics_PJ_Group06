@@ -6,7 +6,7 @@
 
 ## 当前可用内容
 
-P00 已核验原始数据。P01 已交付可重跑的输入准备与共用样本，供集群、特征和日志模块联调。Spark 清洗、特征计算、建模和演示见 [后续阶段](plan.md)。
+P00 已核验原始数据。P01 已交付可重跑的输入准备与共用样本，供集群、特征和日志模块联调。P03 已交付工作流画像、连续周面板与按历史截点特征，本地实测 4,112,526 个 run、11,396 个工作流与 59 个 UTC 周。Spark 清洗、聚类、检测和演示见 [后续阶段](plan.md)。
 
 课程资料可从课程群或组内共享目录按以下文件名获取。Git 记录项目代码和文档，原件与生成批次保存在本地或共享存储。
 
@@ -81,6 +81,19 @@ ssh root@10.176.62.226
 
 ```
 
+
+### P03 工作流画像与周特征
+
+P03 读取 P01 批次目录（优先 `runs_input.parquet`）、P02 的 `runs_clean`、单个 Parquet 或嵌套分区目录（如 `year=2026/month=01/part-00000.parquet`），写出四张表：`workflow_profile.parquet`、`workflow_event_mix.parquet`、`workflow_week.parquet` 和 `workflow_asof.parquet`。输入必须含 `status` 列。样本批次约 1–3 秒，全量 4,112,526 个 run 约 1–2 分钟。
+
+```sh
+P01_BATCH="$(ls -d .local/p01/* | head -n 1)"   # 样本或全量批次均可
+python -m ghawtrace.feature_pipeline --runs-input "$P01_BATCH" --output-root .local/p03
+```
+
+- 命令返回 `batch_dir` 与 `reused`。批次目录含四张 Parquet 和 `manifest.json`，记录输入 SHA-256、参数、分步行数、11 项对账结果及产物行数和字节数；重复运行同一输入会复用已完成批次。入口只发现一次样本清单，冻结输入文件清单和“有清单/无清单”状态；发布前核验分片成员、输入快照、样本清单未出现或改写、截点文件哈希未变。
+- 画像以 `(repo_id, workflow_path)` 为键，含事件与 UTC 小时分布、活跃天数、运行间隔、completed run 的耗时与重试分位、跳过率和失败率；进行中/排队的 run 只计入活动类计数和 `open_run_count`。周面板按 UTC 周一对齐 59 周，区分 `complete`、`partial`、`before_first_observation` 和样本覆盖不足时的 `unknown`；`before_first_observation` 只用于完整观测的工作流。`workflow_asof` 只给截点前已出现的工作流出全局行，结果类特征要求 completed、结论非空且 `updated_at` 早于截点，供 P05、P07 复用。字段与分母见[数据口径](technology_stack.md#表的粒度与分析口径)，手算验收见 [test_p03.py](tests/test_p03.py)。
+- P01 样本会在输入目录内读取 `sample_manifest.json`，把 12 个 cohort 工作流视为完整观测；其余锚点工作流有 run 的周记 `partial`，所有未观测周（包括锚点之前）记 `unknown`（null），不会伪造零运行周或“出现前”。单文件或改名目录可用 `--sample-manifest` 显式传入。`--cutoffs my_cutoffs.parquet` 可指定 `cutoff_id`、`cutoff_utc`（可选 `repo_id`、`workflow_path` 限定单个工作流，两列必须同时为空或同时非空），`--cutoff-grid none` 可跳过截点表。
 
 ### 教师脚本双分片抽查（可选）
 
