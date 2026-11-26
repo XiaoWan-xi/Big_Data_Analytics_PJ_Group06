@@ -53,6 +53,7 @@ python ./ghawtrace/convert_for_spark2.py <input_dir> <output_dir>[limit] [--clea
 ssh root@10.176.62.226
 
 HDFS_URI="hdfs://10.176.62.230:9000"
+
 /opt/spark/bin/spark-submit \
   --master spark://10.176.62.226:7077 \
   --deploy-mode client \
@@ -61,13 +62,38 @@ HDFS_URI="hdfs://10.176.62.230:9000"
   --conf "spark.executor.extraJavaOptions=-Duser.timezone=UTC" \
   --executor-cores 2 \
   --executor-memory 1536m \
-  --conf spark.sql.shuffle.partitions=36 \
+  --conf spark.sql.shuffle.partitions=24 \
   "${APP_SCRIPT}" \
+  "${LABEL}" \
   "${HDFS_URI}/${INPUT_PATH}" \
   "${HDFS_URI}/${OUTPUT_PATH}" \
   "${REPORT_OUTPUT_PATH}" 2>&1 | tee "${LOG_PATH}"
 
 ```
+
+#### 分区策略测试
+``` bash
+ssh root@10.176.62.226
+
+HDFS_URI="hdfs://10.176.62.230:9000"
+LABEL="partition-p24"
+
+/opt/spark/bin/spark-submit \
+  --master spark://10.176.62.226:7077 \
+  --deploy-mode client \
+  --conf spark.hadoop.fs.defaultFS="${HDFS_URI}" \
+  --conf "spark.driver.extraJavaOptions=-Duser.timezone=UTC" \
+  --conf "spark.executor.extraJavaOptions=-Duser.timezone=UTC" \
+  --executor-cores 2 \
+  --executor-memory 1536m \
+  --conf spark.sql.shuffle.partitions=24 \
+  "${APP_SCRIPT}" \
+  "${LABEL}" \
+  "${HDFS_URI}/${INPUT_PATH}" \
+  "${HDFS_URI}/${OUTPUT_PATH}" \
+  "${REPORT_OUTPUT_PATH}" 2>&1 | tee "${LOG_PATH}"
+```
+
 ### 烟雾测试
 ``` bash
 ssh root@10.176.62.226
@@ -81,6 +107,73 @@ ssh root@10.176.62.226
 
 ```
 
+### 节点上p02修改测试
+验证 workflow_id 可空保留、status 未知保留为活动但不进结果分母、workflow_path 缺失仍隔离这三条边界
+``` bash
+cd /tmp/tests
+CLEAN_RUNS_PATH=/tmp/tests/clean_runs.py \
+  /opt/spark/bin/spark-submit \
+    --master local[1] \
+    --py-files /tmp/tests/clean_runs.py \
+    --conf spark.pyspark.python=python \
+    --conf spark.pyspark.driver.python=python \
+    /tmp/tests/verify_nullable_fields.py \
+    2>&1 | tee /tmp/tests/verify_nullable_fields.log
+```
+期望输出：
+```
+[setup] loading clean_runs from: /tmp/tests/clean_runs.py
+...
+[debug] out_dir tree:
+   . dirs= ['batches', 'current'] files= []
+   batches dirs= ['app-..._xxxx'] files= []
+   current dirs= ['runs_clean', 'runs_quarantine'] files= ['_SUCCESS']
+   ...
+[debug] clean_dir: /tmp/verify_nullable_.../out_clean/current/runs_clean
+[report] retained_rows: 3
+[report] total_quarantined_rows: 1
+[report] quarantine_breakdown: {'INVALID_WORKFLOW_PATH': 1}
+[report] unfinished_by_status: {'<NULL>': 1}
+[report] null_status_count: 1
+[report] null_conclusion_count: 1
+[clean] run_ids: [1, 2, 4]
+[quarantine] run_ids: [3]
+[quarantine] reasons: ['INVALID_WORKFLOW_PATH']
+PASS - workflow_id null retained
+PASS - status null retained as activity
+PASS - workflow_path null quarantined
+PASS - normal run retained
+PASS - retained_rows == 3
+PASS - quarantined_rows == 1
+PASS - INVALID_WORKFLOW_PATH == 1
+PASS - unfinished <NULL> == 1
+PASS - null_status_count == 1
+PASS - null_conclusion_count == 1
+RESULT: ALL PASS
+```
+
+用故障注入在发布流程的 4 个关键点（写批次清洗表后、写批次 _SUCCESS 后、写 staging _SUCCESS 后、rename current→backup 后）分别抛 I/O 错误，验证任一步失败时回滚逻辑都能让下游仍完整读到上一成功批次的 current
+```bash
+cd /tmp/tests
+CLEAN_RUNS_PATH=/tmp/tests/clean_runs.py \
+  /opt/spark/bin/spark-submit \
+    --master local[1] \
+    --py-files /tmp/tests/clean_runs.py \
+    --conf spark.pyspark.python=python \
+    --conf spark.pyspark.driver.python=python \
+    /tmp/tests/inject_failure.py \
+    2>&1 | tee /tmp/tests/inject_failure.log
+```
+期望输出：
+```
+FAULT INJECTION RESULTS
+PASS - after_batch_clean_write - current intact: local-1795649934943_030f6ead; fault: Injected fault at stage: after_batch_clean_write
+PASS - after_batch_success - current intact: local-1795649934943_115f4b16; fault: Injected fault at stage: after_batch_success
+PASS - after_stage_success - current intact: local-1795649934943_f3d8cf84; fault: Injected fault at stage: after_stage_success
+PASS - after_rename_current_to_backup - current intact: local-1795649934943_0c67e804; fault: Injected fault at stage: after_rename_current_to_backup
+============================================================
+RESULT: ALL PASS
+```
 
 ### P03 工作流画像与周特征
 

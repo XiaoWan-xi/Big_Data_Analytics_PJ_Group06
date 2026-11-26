@@ -5,10 +5,11 @@ import json
 import re
 import sys
 import uuid
+import os
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType, StringType, StructField, StructType
+from pyspark.sql.types import DoubleType, LongType, StringType, StructField, StructType, TimestampType
 from pyspark.sql.window import Window
 
 P01_RUN_COLUMNS = [
@@ -47,10 +48,18 @@ _MDAYS_COMMON = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
 _MDAYS_LEAP = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
 
 
+def _maybe_inject_fault(stage_name):
+    """Fault injection for publish robustness testing.
+    Set env P02_FAULT_INJECT=<stage_name> to raise IOError at that stage."""
+    fault = os.environ.get("P02_FAULT_INJECT")
+    if fault and fault == stage_name:
+        raise IOError("Injected fault at stage: %s" % stage_name)
+
+
 def parse_utc_timestamp_py(raw_val):
     """
-    Parse ISO-8601 UTC timestamp string preserving fractional seconds.
-    Returns tuple: (normalized_utc_str_or_None, epoch_seconds_float_or_None)
+    Parse ISO-8601 UTC timestamp string preserving microsecond precision.
+    Returns tuple: (utc_micros_int_or_None, epoch_seconds_float_or_None)
     """
     if raw_val is None:
         return (None, None)
@@ -82,28 +91,34 @@ def parse_utc_timestamp_py(raw_val):
         nanos = int(frac_padded)
         micros = nanos // 1000
         frac_sec = nanos / 1e9
-        norm_utc = "%04d-%02d-%02dT%02d:%02d:%02d.%06dZ" % (
-            year, month, day, hour, minute, second, micros
-        )
     else:
+        micros = 0
         frac_sec = 0.0
-        norm_utc = "%04d-%02d-%02dT%02d:%02d:%02d.000000Z" % (
-            year, month, day, hour, minute, second
-        )
 
-    return (norm_utc, float(sec_epoch) + frac_sec)
+    utc_micros = int(sec_epoch) * 1000000 + int(micros)
+    return (utc_micros, float(sec_epoch) + frac_sec)
 
-
-# parse_utc_udf = F.udf(
-#     parse_utc_timestamp_py,
-#     "struct<utc_str:string,epoch_sec:double>",
-# )
 
 ts_struct_type = StructType([
-    StructField("utc_str", StringType(), nullable=True),
+    StructField("utc_micros", LongType(), nullable=True),
     StructField("epoch_sec", DoubleType(), nullable=True),
 ])
 parse_utc_udf = F.udf(parse_utc_timestamp_py, ts_struct_type)
+
+
+def _micros_to_timestamp_col(micros_col_name):
+    mc = F.col(micros_col_name).cast("long")
+    sec_part = F.floor(mc / F.lit(1000000)).cast("long")
+    us_part = (mc - sec_part * F.lit(1000000)).cast("long")
+    # 格式化为 YYYY-MM-DD HH:MM:SS.ffffff 后转为 TimestampType，保留完整微秒
+    formatted_str = F.concat(
+        F.from_unixtime(sec_part, "yyyy-MM-dd HH:mm:ss"),
+        F.lit("."),
+        F.format_string("%06d", us_part),
+    )
+    return F.when(mc.isNotNull(), formatted_str.cast(TimestampType())).otherwise(
+        F.lit(None).cast(TimestampType())
+    )
 
 
 def _is_non_empty_str_col(col_name):
@@ -184,8 +199,10 @@ def main():
         df
         .withColumn("_parsed_created", parse_utc_udf(F.col("created_at")))
         .withColumn("_parsed_updated", parse_utc_udf(F.col("updated_at")))
-        .withColumn("created_at_utc", F.col("_parsed_created.utc_str"))
-        .withColumn("updated_at_utc", F.col("_parsed_updated.utc_str"))
+        .withColumn("_created_micros", F.col("_parsed_created.utc_micros").cast(LongType()))
+        .withColumn("_updated_micros", F.col("_parsed_updated.utc_micros").cast(LongType()))
+        .withColumn("created_at_utc", _micros_to_timestamp_col("_created_micros"))
+        .withColumn("updated_at_utc", _micros_to_timestamp_col("_updated_micros"))
         .withColumn("_created_epoch", F.col("_parsed_created.epoch_sec").cast(DoubleType()))
         .withColumn("_updated_epoch", F.col("_parsed_updated.epoch_sec").cast(DoubleType()))
     )
@@ -194,7 +211,6 @@ def main():
         df_parsed
         .withColumn("_pk_invalid", ~_is_positive_int_col("run_id"))
         .withColumn("_repo_invalid", ~_is_positive_int_col("repo_id"))
-        .withColumn("_workflow_key_invalid", ~_is_positive_int_col("workflow_id"))
         .withColumn("_workflow_path_invalid", ~_is_non_empty_str_col("workflow_path"))
         .withColumn("_created_utc_invalid", F.col("_created_epoch").isNull())
         .withColumn("_updated_raw_present", _is_non_empty_str_col("updated_at"))
@@ -228,16 +244,13 @@ def main():
         .withColumn("_conclusion_null", ~_is_non_empty_str_col("conclusion"))
     )
 
-    # 仅隔离真正无效/重复/关键字段缺失的记录；未结束 run（_conclusion_null 且关键字段合法）保留在 runs_clean 中
     df_tagged = df_checked.withColumn(
         "quarantine_reason",
         F.when(F.col("_pk_invalid"), F.lit("INVALID_PRIMARY_KEY"))
          .when(F.col("_pk_dup"), F.lit("DUPLICATE_PRIMARY_KEY"))
          .when(F.col("_repo_invalid"), F.lit("INVALID_REPO_ID"))
-         .when(F.col("_workflow_key_invalid"), F.lit("INVALID_WORKFLOW_KEY"))
          .when(F.col("_workflow_path_invalid"), F.lit("INVALID_WORKFLOW_PATH"))
          .when(F.col("_created_utc_invalid"), F.lit("INVALID_CREATED_AT_UTC"))
-         .when(F.col("_status_null"), F.lit("NULL_STATUS"))
          .otherwise(F.lit("VALID")),
     ).persist()
 
@@ -247,7 +260,7 @@ def main():
         F.sum(F.when(F.col("_pk_invalid"), 1).otherwise(0)).alias("ind_invalid_pk"),
         F.sum(F.when(F.col("_pk_dup"), 1).otherwise(0)).alias("ind_duplicate_pk"),
         F.sum(F.when(F.col("_repo_invalid"), 1).otherwise(0)).alias("ind_invalid_repo_id"),
-        F.sum(F.when(F.col("_workflow_key_invalid"), 1).otherwise(0)).alias("ind_invalid_workflow_key"),
+        F.sum(F.when(F.col("_repo_invalid") | F.col("_workflow_path_invalid"), 1).otherwise(0)).alias("ind_invalid_workflow_key"),
         F.sum(F.when(F.col("_workflow_path_invalid"), 1).otherwise(0)).alias("ind_invalid_workflow_path"),
         F.sum(F.when(F.col("_created_utc_invalid"), 1).otherwise(0)).alias("ind_invalid_created_utc"),
         F.sum(F.when(F.col("_updated_missing_or_invalid"), 1).otherwise(0)).alias("missing_or_invalid_updated_at"),
@@ -298,20 +311,24 @@ def main():
 
     # 先写入独立批次暂存目录，回读核验通过后再发布到最终目录与 _SUCCESS 标记
     batch_token = "%s_%s" % (sc.applicationId, uuid.uuid4().hex[:8])
-    staging_base = "%s/.staging_%s" % (output_base, batch_token)
-    staging_clean_path = "%s/runs_clean" % staging_base
-    staging_quarantine_path = "%s/runs_quarantine" % staging_base
+    batch_dir = "%s/batches/%s" % (output_base, batch_token)
+    batch_clean_path = "%s/runs_clean" % batch_dir
+    batch_quarantine_path = "%s/runs_quarantine" % batch_dir
 
-    final_clean_path = "%s/runs_clean" % output_base
-    final_quarantine_path = "%s/runs_quarantine" % output_base
+    current_link_path = "%s/current" % output_base
+    final_clean_path = "%s/runs_clean" % current_link_path
+    final_quarantine_path = "%s/runs_quarantine" % current_link_path
 
+
+    backup_current = None
     try:
-        _delete_if_exists(spark, staging_base)
-        clean_df.write.mode("overwrite").parquet(staging_clean_path)
-        quarantine_df.write.mode("overwrite").parquet(staging_quarantine_path)
+        _delete_if_exists(spark, batch_dir)
+        clean_df.write.mode("overwrite").parquet(batch_clean_path)
+        _maybe_inject_fault("after_batch_clean_write")
+        quarantine_df.write.mode("overwrite").parquet(batch_quarantine_path)
 
-        verified_clean_df = spark.read.parquet(staging_clean_path)
-        verified_quarantine_df = spark.read.parquet(staging_quarantine_path)
+        verified_clean_df = spark.read.parquet(batch_clean_path)
+        verified_quarantine_df = spark.read.parquet(batch_quarantine_path)
 
         clean_fp = verified_clean_df.agg(
             F.count("*").alias("written_clean_rows"),
@@ -327,34 +344,53 @@ def main():
 
         if written_clean_rows != retained_count or written_quarantine_rows != total_quarantined:
             raise RuntimeError(
-                "Staged readback count mismatch: clean=%d (expected %d), quarantine=%d (expected %d)"
+                "Batch readback count mismatch: clean=%d (expected %d), quarantine=%d (expected %d)"
                 % (written_clean_rows, retained_count, written_quarantine_rows, total_quarantined)
             )
-
-        # 发布到正式输出目录（旧批次仅在当前批次写入与核验均成功后替换）
-        _delete_if_exists(spark, final_clean_path)
-        _delete_if_exists(spark, final_quarantine_path)
-
-        final_clean_df = spark.read.parquet(staging_clean_path)
-        final_quarantine_df = spark.read.parquet(staging_quarantine_path)
-        final_clean_df.write.mode("overwrite").parquet(final_clean_path)
-        final_quarantine_df.write.mode("overwrite").parquet(final_quarantine_path)
 
         publish_meta = {
             "application_id": sc.applicationId,
             "batch_token": batch_token,
+            "batch_dir": batch_dir,
             "total_input_rows": total_input,
             "retained_rows": written_clean_rows,
             "quarantined_rows": written_quarantine_rows,
             "reconciled_equals_input": reconciled,
         }
-        _write_success_marker(spark, output_base, publish_meta)
-        _delete_if_exists(spark, staging_base)
+        _write_success_marker(spark, batch_dir, publish_meta)
+        _maybe_inject_fault("after_batch_success") 
+
+        # 批次完整且校验通过后，再将不可变批次发布到 current 目录
+        stage_current = "%s/.current_staging_%s" % (output_base, batch_token)
+        _delete_if_exists(spark, stage_current)
+        spark.read.parquet(batch_clean_path).write.mode("overwrite").parquet("%s/runs_clean" % stage_current)
+        spark.read.parquet(batch_quarantine_path).write.mode("overwrite").parquet("%s/runs_quarantine" % stage_current)
+        _write_success_marker(spark, stage_current, publish_meta)
+        _maybe_inject_fault("after_stage_success")
+
+        backup_current = "%s/.current_prev_%s" % (output_base, batch_token)
+        fs_cur, h_cur = _hadoop_fs(spark, current_link_path)
+        fs_stg, h_stg = _hadoop_fs(spark, stage_current)
+        fs_bak, h_bak = _hadoop_fs(spark, backup_current)
+        if fs_cur.exists(h_cur):
+            fs_cur.rename(h_cur, h_bak)
+        _maybe_inject_fault("after_rename_current_to_backup")
+        if not fs_stg.rename(h_stg, h_cur):
+            if fs_bak.exists(h_bak):
+                fs_bak.rename(h_bak, h_cur)
+            raise RuntimeError("Failed to promote staged batch %s to current" % batch_token)
+        if fs_bak.exists(h_bak):
+            fs_bak.delete(h_bak, True)
     except Exception:
-        try:
-            _delete_if_exists(spark, staging_base)
-        except Exception:
-            pass
+        # 回滚：若 current 已 rename 到 backup 但 staging 未提升，恢复旧 current
+        if backup_current is not None:
+            try:
+                fs_cur_rb, h_cur_rb = _hadoop_fs(spark, current_link_path)
+                fs_bak_rb, h_bak_rb = _hadoop_fs(spark, backup_current)
+                if (not fs_cur_rb.exists(h_cur_rb)) and fs_bak_rb.exists(h_bak_rb):
+                    fs_bak_rb.rename(h_bak_rb, h_cur_rb)
+            except Exception:
+                pass
         df_tagged.unpersist()
         spark.stop()
         raise

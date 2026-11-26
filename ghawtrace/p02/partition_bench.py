@@ -62,6 +62,80 @@ def _zero_totals():
         "disk_bytes_spilled": 0,
     }
 
+def evaluate_t05_evidence(stages_raw, executors_raw):
+    """
+    纯函数：根据两个 Spark REST 返回判定 T05 证据是否足够可验收。
+    返回 (evidence_complete, breakdown, errors)。
+    可验收条件（全部满足）：
+      1. 两个接口都正常返回 list（不是 error dict）；
+      2. 至少 1 个 status == "COMPLETE" 的 stage；
+      3. 这些完成 stage 的 numCompleteTasks 累计 > 0；
+      4. 至少 1 个非 driver 的 executor 有 completedTasks > 0。
+    """
+    stages_ok = isinstance(stages_raw, list)
+    executors_ok = isinstance(executors_raw, list)
+
+    errors = []
+    if not stages_ok:
+        errors.append({
+            "endpoint": "stages",
+            "detail": stages_raw if isinstance(stages_raw, dict)
+                      else {"error": "Unexpected stages payload type"},
+        })
+    if not executors_ok:
+        errors.append({
+            "endpoint": "executors",
+            "detail": executors_raw if isinstance(executors_raw, dict)
+                      else {"error": "Unexpected executors payload type"},
+        })
+
+    completed_stages = []
+    total_completed_tasks = 0
+    if stages_ok:
+        completed_stages = [s for s in stages_raw if s.get("status") == "COMPLETE"]
+        for s in completed_stages:
+            try:
+                total_completed_tasks += int(s.get("numCompleteTasks") or 0)
+            except (TypeError, ValueError):
+                pass
+
+    workers_with_tasks = 0
+    if executors_ok:
+        for ex in executors_raw:
+            if ex.get("id") == "driver":
+                continue
+            try:
+                if int(ex.get("completedTasks") or 0) > 0:
+                    workers_with_tasks += 1
+            except (TypeError, ValueError):
+                pass
+
+    has_completed_stage = len(completed_stages) > 0
+    has_tasks = total_completed_tasks > 0
+    has_worker_with_tasks = workers_with_tasks > 0
+
+    if stages_ok and not has_completed_stage:
+        errors.append({"endpoint": "stages", "detail": "no stage with status=COMPLETE"})
+    if stages_ok and has_completed_stage and not has_tasks:
+        errors.append({"endpoint": "stages", "detail": "completed stages have zero tasks"})
+    if executors_ok and not has_worker_with_tasks:
+        errors.append({"endpoint": "executors",
+                       "detail": "no non-driver executor with completedTasks > 0"})
+
+    evidence_complete = bool(
+        stages_ok and executors_ok
+        and has_completed_stage and has_tasks and has_worker_with_tasks
+    )
+
+    breakdown = {
+        "stages_available": stages_ok,
+        "executors_available": executors_ok,
+        "completed_stage_count": len(completed_stages),
+        "total_completed_tasks": total_completed_tasks,
+        "workers_with_completed_tasks": workers_with_tasks,
+    }
+    return evidence_complete, breakdown, errors
+
 
 def main():
     if len(sys.argv) < 5:
@@ -175,19 +249,9 @@ def main():
                     "completed_tasks": ex.get("completedTasks"),
                 })
 
-    telemetry_errors = []
-    if not stages_ok:
-        telemetry_errors.append({
-            "endpoint": "stages",
-            "detail": stages_raw if isinstance(stages_raw, dict) else {"error": "Unexpected stages payload type"},
-        })
-    if not executors_ok:
-        telemetry_errors.append({
-            "endpoint": "executors",
-            "detail": executors_raw if isinstance(executors_raw, dict) else {"error": "Unexpected executors payload type"},
-        })
-
-    evidence_complete = bool(stages_ok and executors_ok)
+    evidence_complete, evidence_breakdown, telemetry_errors = evaluate_t05_evidence(
+        stages_raw, executors_raw
+    )
 
     # 3. 回读 HDFS 聚合结果，计算确定性校验和
     written_df = spark.read.parquet(output_path)
@@ -225,6 +289,7 @@ def main():
         "output_path": output_path,
         "evidence_complete": evidence_complete,
         "valid_for_t05_acceptance": evidence_complete,
+        "evidence_breakdown": evidence_breakdown,
         "telemetry_status": {
             "stages_available": stages_ok,
             "executors_available": executors_ok,

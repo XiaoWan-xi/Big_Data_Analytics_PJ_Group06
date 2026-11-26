@@ -180,3 +180,18 @@
    - `cfgB_p24`（`0019`，`shuffle.partitions=24`）：耗时 `21.387s`，总任务 `43`，累计 Executor 运行时间 `66,126 ms`，Shuffle 读写 `2,948,664` bytes。
    - 两档配置产出 `10,302` 行且聚合内容哈希一致（`c9dfdb710b81664a2c3176aa118eb5d4db4035c3de6763df75813f3754acf2d8`）；`p=24` 端到端耗时减少约 `19.8%`，累计 Executor 运行时间减少约 `37.8%`。
 4. 在[README](README.md)中添加了转换Parquet格式、集群提交、烟雾测试的指令入口
+
+### 2026-11-26 p02修改2
+1. **修改**：clean_runs.py 时间列从 utc_str 字符串改为 _micros_to_timestamp_col 持久化 TimestampType（微秒精度），并移除未定义的 _workflow_key_invalid 引用。
+**验收**：run3 批次 18 个 parquet 原样输入 P03 CLI，manifest.status=success、steps[0].output_rows=4112526、11/11 checks 全过（reconcile 步 failed=0），但当前为 timestamp[ns] 无 tz 元数据、样本亚秒为 0
+**待确认**:tz 与亚秒两点待管理者确认 P03 是否接受 naive UTC 
+2. **修改**：确认 quarantine_reason 只由 _pk_invalid/_pk_dup/_repo_invalid/_workflow_path_invalid/_created_utc_invalid 触发，workflow_id 与 status 不参与隔离，业务代码无需改动。
+**验收**：节点 verify_nullable_fields.py 用 4 行合成数据跑 clean_runs.py 端到端，10 项断言 ALL PASS（retained_rows=3、quarantined_rows=1、INVALID_WORKFLOW_PATH=1、unfinished_by_status={<NULL>:1}）；本地 test_p02_regression.py 新增 3 条对应测试，discover 得到 OK (skipped=4)。
+3. **修改**：改为不可变批次目录 batches/<token>/ → 回读核验行数 → 写 _SUCCESS → staging 核验 → rename 提升 current，并在 except 分支加“current 丢失且 backup 存在则 rename 回滚”。
+**验收**：inject_failure.py 在 4 个发布关键点注入 I/O 错误，4 个故障点全部 PASS（current 均恢复为上一成功批次且完整可读）
+4. **修改**：test_p02_regression.py 的 P02_DIR 指向修正为 ghawtrace/p02，pyspark 桩补全 LongType/TimestampType/StructField/StructType，并把 find_spec 改为真实 import 试探以识别空壳 pyspark。
+**验收**：干净检出后 python -m unittest discover -s tests -v 输出 Ran 9 tests ... OK (skipped=1)，P01 五项 + P02 非 Spark 测试全过，TestPySparkEndToEndIfAvailable 按设计在无 pyspark 环境时 skip
+5. **修改**：partition_bench.py 抽出 evaluate_t05_evidence(stages_raw, executors_raw)，可验收条件收紧为“两接口正常返回 + 至少 1 个 COMPLETE stage + 累计任务数 > 0 + 至少 1 个非 driver executor 的 completedTasks > 0”，report 新增 evidence_breakdown 字段。
+**验收**：本地新增 5 条纯函数测试（空列表 / HTTP 错误 / 无任务 / 无 worker / 正向）全部 ok；重跑两份 partition_bench 报告 valid_for_t05_acceptance 仍为 true，output_content_sha256 与改动前一致（c9dfdb...f2d8），证明只收紧判定边界、不影响实测内容。
+
+

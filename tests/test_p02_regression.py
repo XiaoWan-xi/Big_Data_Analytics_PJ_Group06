@@ -1,4 +1,7 @@
 # -*- coding: utf-8 -*-
+# usage: $env:PYTHONUTF8="1"
+# $env:PYTHONIOENCODING="utf-8"
+# python -m unittest discover -s tests -v
 import importlib
 import importlib.machinery
 import importlib.util
@@ -17,7 +20,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-P02_DIR = REPO_ROOT / "ghawtrace"
+P02_DIR = REPO_ROOT / "ghawtrace" / "p02"
 
 _COMPAT_SHIMS_INSTALLED = False
 _USED_PYSPARK_STUB = False
@@ -40,12 +43,21 @@ def _install_compat_shims():
             urllib2_mod.HTTPError = urllib.error.HTTPError
             sys.modules["urllib2"] = urllib2_mod
 
-    has_real = False
-    try:
-        has_real = importlib.util.find_spec("pyspark") is not None
-    except ValueError:
-        has_real = False
+    def _pyspark_is_usable():
+        try:
+            from pyspark.sql import SparkSession  # noqa: F401
+            from pyspark.sql import functions as _F  # noqa: F401
+            from pyspark.sql.types import (  # noqa: F401
+                DoubleType, LongType, StringType,
+                StructField, StructType, TimestampType,
+            )
+            from pyspark.sql.window import Window  # noqa: F401
+            return True
+        except Exception:
+            return False
 
+    has_real = _pyspark_is_usable()
+    
     if not has_real:
         _USED_PYSPARK_STUB = True
         pyspark_mod = types.ModuleType("pyspark")
@@ -171,7 +183,11 @@ def _install_compat_shims():
         functions_mod.udf = _udf
         functions_mod.col = lambda *a, **kw: _DummyCol(*a, **kw)
         types_mod.DoubleType = lambda: "double"
+        types_mod.LongType = lambda: "long"
         types_mod.StringType = lambda: "string"
+        types_mod.TimestampType = lambda: "timestamp"
+        types_mod.StructField = lambda name, typ, nullable=True, metadata=None: (name, typ)
+        types_mod.StructType = lambda fields: list(fields)
         pyspark_mod.sql = sql_mod
 
         for mod_name, mod_obj in [
@@ -336,6 +352,55 @@ class TestPartitionBenchTelemetryFailure(unittest.TestCase):
         self.assertIsInstance(res, dict)
         self.assertIn("error", res)
 
+    def test_empty_stages_and_workers_are_not_acceptable(self):
+        ok, breakdown, errors = bench_mod.evaluate_t05_evidence([], [])
+        self.assertFalse(ok)
+        self.assertEqual(breakdown["completed_stage_count"], 0)
+        self.assertEqual(breakdown["total_completed_tasks"], 0)
+        self.assertEqual(breakdown["workers_with_completed_tasks"], 0)
+        self.assertTrue(any(e["endpoint"] == "stages" for e in errors))
+        self.assertTrue(any(e["endpoint"] == "executors" for e in errors))
+
+    def test_http_error_is_not_acceptable(self):
+        ok, _, errors = bench_mod.evaluate_t05_evidence(
+            {"error": "Connection refused"},
+            {"error": "Connection refused"},
+        )
+        self.assertFalse(ok)
+        self.assertEqual(len(errors), 2)
+
+    def test_completed_stages_without_tasks_are_not_acceptable(self):
+        stages = [{"stageId": 0, "status": "COMPLETE", "numCompleteTasks": 0}]
+        executors = [{"id": "1", "completedTasks": 4}]
+        ok, breakdown, errors = bench_mod.evaluate_t05_evidence(stages, executors)
+        self.assertFalse(ok)
+        self.assertEqual(breakdown["completed_stage_count"], 1)
+        self.assertEqual(breakdown["total_completed_tasks"], 0)
+
+    def test_completed_stage_without_worker_is_not_acceptable(self):
+        stages = [{"stageId": 0, "status": "COMPLETE", "numCompleteTasks": 4}]
+        executors = [{"id": "driver", "completedTasks": 0}]
+        ok, breakdown, errors = bench_mod.evaluate_t05_evidence(stages, executors)
+        self.assertFalse(ok)
+        self.assertEqual(breakdown["workers_with_completed_tasks"], 0)
+
+    def test_completed_stage_with_tasks_and_worker_is_acceptable(self):
+        stages = [
+            {"stageId": 0, "status": "COMPLETE", "numCompleteTasks": 4},
+            {"stageId": 1, "status": "COMPLETE", "numCompleteTasks": 3},
+        ]
+        executors = [
+            {"id": "driver", "completedTasks": 0},
+            {"id": "1", "completedTasks": 4},
+            {"id": "2", "completedTasks": 3},
+        ]
+        ok, breakdown, errors = bench_mod.evaluate_t05_evidence(stages, executors)
+        self.assertTrue(ok)
+        self.assertEqual(breakdown["completed_stage_count"], 2)
+        self.assertEqual(breakdown["total_completed_tasks"], 7)
+        self.assertEqual(breakdown["workers_with_completed_tasks"], 2)
+        self.assertEqual(errors, [])
+
 
 class TestPySparkEndToEndIfAvailable(unittest.TestCase):
     @classmethod
@@ -402,6 +467,99 @@ class TestPySparkEndToEndIfAvailable(unittest.TestCase):
                 self.assertIsNone(clean_rows[3]["elapsed_seconds"])
         finally:
             spark.stop()
+
+    def _run_clean_with_rows(self, rows):
+        """起 Spark，写 rows 到 parquet，调 clean_mod.main，返回 (report, spark, clean_df, quarantine_df)。"""
+        import shutil
+        spark_sql_mod = importlib.import_module("pyspark.sql")
+        SparkSession = spark_sql_mod.SparkSession
+        spark = (SparkSession.builder
+                 .master("local[1]")
+                 .appName("test-p02-nullable-fields")
+                 .getOrCreate())
+        cols = clean_mod.P01_RUN_COLUMNS
+        in_df = spark.createDataFrame(rows, cols)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        in_dir = os.path.join(tmp, "in_parquet")
+        out_dir = os.path.join(tmp, "out_clean")
+        report_path = os.path.join(tmp, "report.json")
+        in_df.write.mode("overwrite").parquet(in_dir)
+        orig_argv = sys.argv
+        try:
+            sys.argv = ["clean_runs.py", in_dir, out_dir, report_path]
+            clean_mod.main()
+        finally:
+            sys.argv = orig_argv
+        rep = json.loads(Path(report_path).read_text(encoding="utf-8"))
+        clean_df = spark.read.parquet(os.path.join(out_dir, "runs_clean"))
+        quarantine_df = spark.read.parquet(os.path.join(out_dir, "runs_quarantine"))
+        self.addCleanup(spark.stop)
+        return rep, spark, clean_df, quarantine_df
+
+    def test_null_workflow_id_is_retained(self):
+        if not self.has_pyspark:
+            self.skipTest("pyspark not installed in local Python environment")
+        rows = [
+            (1, 10, None, ".github/workflows/a.yml",
+             "2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z",
+             "push", "completed", "success", 1, 0, 0, 0),
+        ]
+        rep, spark, clean_df, quarantine_df = self._run_clean_with_rows(rows)
+        self.assertEqual(rep["retained_rows"], 1)
+        self.assertEqual(rep["total_quarantined_rows"], 0)
+        clean_rows = {r["run_id"]: r for r in clean_df.collect()}
+        self.assertIn(1, clean_rows)
+        self.assertIsNone(clean_rows[1]["workflow_id"])
+        self.assertEqual(quarantine_df.count(), 0)
+
+    def test_null_status_is_activity_not_outcome(self):
+        if not self.has_pyspark:
+            self.skipTest("pyspark not installed in local Python environment")
+        rows = [
+            (1, 10, 100, ".github/workflows/a.yml",
+             "2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z",
+             "push", None, None, 1, 0, 0, 0),
+            (2, 10, 100, ".github/workflows/a.yml",
+             "2026-01-01T00:01:00Z", "2026-01-01T00:01:02Z",
+             "push", "completed", "failure", 1, 0, 0, 0),
+        ]
+        rep, spark, clean_df, quarantine_df = self._run_clean_with_rows(rows)
+        self.assertEqual(rep["retained_rows"], 2)
+        self.assertEqual(rep["total_quarantined_rows"], 0)
+        self.assertEqual(rep["retained_unfinished_runs"]["total_rows"], 1)
+        self.assertEqual(rep["retained_unfinished_runs"]["by_status"].get("<NULL>"), 1)
+        self.assertEqual(rep["independent_rule_hit_counts"]["null_status"], 1)
+        self.assertEqual(rep["independent_rule_hit_counts"]["null_conclusion"], 1)
+        clean_rows = {r["run_id"]: r for r in clean_df.collect()}
+        self.assertIn(1, clean_rows)
+        self.assertIsNone(clean_rows[1]["status"])
+        self.assertIsNone(clean_rows[1]["conclusion"])
+        self.assertEqual(quarantine_df.count(), 0)
+
+    def test_missing_workflow_path_is_quarantined(self):
+        if not self.has_pyspark:
+            self.skipTest("pyspark not installed in local Python environment")
+        rows = [
+            (1, 10, 100, None,
+             "2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z",
+             "push", "completed", "success", 1, 0, 0, 0),
+            (2, 10, 100, "",
+             "2026-01-01T00:01:00Z", "2026-01-01T00:01:02Z",
+             "push", "completed", "success", 1, 0, 0, 0),
+            (3, 10, 100, ".github/workflows/ok.yml",
+             "2026-01-01T00:02:00Z", "2026-01-01T00:02:01Z",
+             "push", "completed", "success", 1, 0, 0, 0),
+        ]
+        rep, spark, clean_df, quarantine_df = self._run_clean_with_rows(rows)
+        self.assertEqual(rep["retained_rows"], 1)
+        self.assertEqual(rep["total_quarantined_rows"], 2)
+        self.assertEqual(rep["mutually_exclusive_quarantine_breakdown"].get("INVALID_WORKFLOW_PATH"), 2)
+        q_rows = quarantine_df.collect()
+        self.assertEqual({r["run_id"] for r in q_rows}, {1, 2})
+        self.assertTrue(all(r["quarantine_reason"] == "INVALID_WORKFLOW_PATH" for r in q_rows))
+        clean_rows = {r["run_id"]: r for r in clean_df.collect()}
+        self.assertIn(3, clean_rows)
 
 
 if __name__ == "__main__":
