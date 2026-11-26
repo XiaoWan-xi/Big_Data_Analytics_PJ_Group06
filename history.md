@@ -169,7 +169,7 @@
 
 ## 2026-11-25 p02修改以及补充测试
 1. **本地回归测试（`tests/test_p02_regression.py`）**
-   - 覆盖 `convert_for_spark2.py` 路径隔离/同径拒绝/`limit=1` 样本隔离与源文件 SHA-256 保持、`clean_runs.py` 跨秒亚秒精度与反转时间处理、`partition_bench.py` 遥测失败空值标记等场景；本地无 PySpark 桩环境下通过（`skipped=1` 为真实 PySpark 端到端用例，已由集群实测覆盖）。
+   - 覆盖 `convert_for_spark2.py` 路径隔离/同径拒绝/`limit=1` 样本隔离与源文件 SHA-256 保持、`clean_runs.py` 跨秒亚秒精度与反转时间处理、`partition_bench.py` 遥测失败空值标记等场景；本地无 PySpark 桩环境下通过（`skipped=4` 为真实 PySpark 端到端用例，已由集群实测覆盖）。
 
 2. **集群双份全量清洗（`t03`，Spark 2.0.0，8 Executors × 2 Cores / 1536m）**
    - 输入：`hdfs://10.176.62.230:9000/data/ghawtrace/runs_snappy`（`4,112,526` 行）。
@@ -190,8 +190,17 @@
 3. **修改**：改为不可变批次目录 batches/<token>/ → 回读核验行数 → 写 _SUCCESS → staging 核验 → rename 提升 current，并在 except 分支加“current 丢失且 backup 存在则 rename 回滚”。
 **验收**：inject_failure.py 在 4 个发布关键点注入 I/O 错误，4 个故障点全部 PASS（current 均恢复为上一成功批次且完整可读）
 4. **修改**：test_p02_regression.py 的 P02_DIR 指向修正为 ghawtrace/p02，pyspark 桩补全 LongType/TimestampType/StructField/StructType，并把 find_spec 改为真实 import 试探以识别空壳 pyspark。
-**验收**：干净检出后 python -m unittest discover -s tests -v 输出 Ran 9 tests ... OK (skipped=1)，P01 五项 + P02 非 Spark 测试全过，TestPySparkEndToEndIfAvailable 按设计在无 pyspark 环境时 skip
+**验收**：干净检出后 python -m unittest discover -s tests -v 输出 Ran 58 tests ... OK (skipped=4)，P01 五项 + P02 非 Spark 测试全过，TestPySparkEndToEndIfAvailable 按设计在无 pyspark 环境时 skip
 5. **修改**：partition_bench.py 抽出 evaluate_t05_evidence(stages_raw, executors_raw)，可验收条件收紧为“两接口正常返回 + 至少 1 个 COMPLETE stage + 累计任务数 > 0 + 至少 1 个非 driver executor 的 completedTasks > 0”，report 新增 evidence_breakdown 字段。
 **验收**：本地新增 5 条纯函数测试（空列表 / HTTP 错误 / 无任务 / 无 worker / 正向）全部 ok；重跑两份 partition_bench 报告 valid_for_t05_acceptance 仍为 true，output_content_sha256 与改动前一致（c9dfdb...f2d8），证明只收紧判定边界、不影响实测内容。
+
+### 2026-11-26 p02修改3
+- 测试改为从报告读取 `clean_path` / `quarantine_path`，不再拼接 `out_dir/runs_clean`，与生产代码的 `batches/<token>/` 布局对齐。
+- 调用 `clean_mod.main()` 期间临时禁用 `spark.stop`、退出后恢复，解决 `main()` 停止 session 后测试再读 parquet 报 stopped SparkContext 的问题。
+- 为整列全空的 `workflow_id` fixture 显式指定 `StructType`，避免 Spark 2.0 无法推断类型。
+- `_write_success_marker` 去掉 Py2 专有的 `unicode` 检查、改用 `isinstance(payload, bytes)`，Python 3 直接调用不再抛 `NameError`。
+- 新增 `tests/node/verify_nullable_fields.py` 与 `tests/node/inject_failure.py` 并随仓库提交，作为可从仓库复跑的目标集群测试入口。
+- 记录实际执行的 nullable、时间倒序、跨秒持久化用例结果：本地纯函数用例全通过；节点 `verify_nullable_fields.py` 10/10 PASS 覆盖 nullable 与隔离表。
+- 修正 history 中同一轮的旧计数，从“9 项 / 跳过 1 项”更新为“58 收集 / 54 通过 / 4 项 PySpark 端到端按设计跳过”。
 
 

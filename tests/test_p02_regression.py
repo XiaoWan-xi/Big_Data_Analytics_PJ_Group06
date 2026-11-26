@@ -258,6 +258,26 @@ def _run_convert_main(args):
     finally:
         sys.argv = orig_argv
 
+def _p02_run_schema():
+    """显式 PySpark StructType，对应 clean_mod.P01_RUN_COLUMNS。
+    用于 workflow_id 等整列为 None 时 Spark 2.0 无法推断类型。"""
+    from pyspark.sql.types import LongType, StringType, StructField, StructType
+    return StructType([
+        StructField("run_id", LongType(), True),
+        StructField("repo_id", LongType(), True),
+        StructField("workflow_id", LongType(), True),
+        StructField("workflow_path", StringType(), True),
+        StructField("created_at", StringType(), True),
+        StructField("updated_at", StringType(), True),
+        StructField("event", StringType(), True),
+        StructField("status", StringType(), True),
+        StructField("conclusion", StringType(), True),
+        StructField("run_attempts", LongType(), True),
+        StructField("log_archive_count", LongType(), True),
+        StructField("log_file_count", LongType(), True),
+        StructField("empty_archive_count", LongType(), True),
+    ])
+
 
 class TestConvertForSpark2Regression(unittest.TestCase):
     def test_rejects_same_input_and_output_path(self):
@@ -442,14 +462,19 @@ class TestPySparkEndToEndIfAvailable(unittest.TestCase):
                 in_dir = os.path.join(tmp, "in_parquet")
                 out_dir = os.path.join(tmp, "out_clean")
                 report_path = os.path.join(tmp, "report.json")
-                in_df.write.mode("overwrite").parquet(in_dir)
+                in_dir_uri = Path(in_dir).as_uri()
+                out_dir_uri = Path(out_dir).as_uri()
+                in_df.write.mode("overwrite").parquet(in_dir_uri)
 
                 orig_argv = sys.argv
+                orig_stop = spark.stop
+                spark.stop = lambda: None
                 try:
-                    sys.argv = ["clean_runs.py", in_dir, out_dir, report_path]
+                    sys.argv = ["clean_runs.py", in_dir_uri, out_dir_uri, report_path]
                     clean_mod.main()
                 finally:
                     sys.argv = orig_argv
+                    spark.stop = orig_stop
 
                 rep = json.loads(Path(report_path).read_text(encoding="utf-8"))
                 self.assertTrue(rep["reconciled_equals_input"])
@@ -458,18 +483,23 @@ class TestPySparkEndToEndIfAvailable(unittest.TestCase):
                 self.assertEqual(rep["retained_unfinished_runs"]["total_rows"], 1)
                 self.assertEqual(rep["quality_statistics"]["time_inversion_count"], 1)
 
-                clean_rows = {
-                    r["run_id"]: r
-                    for r in spark.read.parquet(os.path.join(out_dir, "runs_clean")).collect()
-                }
+                clean_df = spark.read.parquet(rep["clean_path"])
+                clean_rows = {r["run_id"]: r for r in clean_df.collect()}
                 self.assertIn(2, clean_rows)
                 self.assertAlmostEqual(clean_rows[1]["elapsed_seconds"], 0.2, places=5)
                 self.assertIsNone(clean_rows[3]["elapsed_seconds"])
         finally:
             spark.stop()
 
-    def _run_clean_with_rows(self, rows):
-        """起 Spark，写 rows 到 parquet，调 clean_mod.main，返回 (report, spark, clean_df, quarantine_df)。"""
+    def _run_clean_with_rows(self, rows, schema=None):
+        """起 Spark，写 rows 到 parquet，调 clean_mod.main，返回 (report, spark, clean_df, quarantine_df)。
+
+        关键点：
+        - 用 file:// URI 让 Spark 走本地 FS（节点默认 fs.defaultFS 是 HDFS）
+        - 临时禁用 spark.stop，避免 main() 内部 stop 后再读 parquet 报 stopped SparkContext
+        - 从 report 的 clean_path / quarantine_path 读，不拼 out_dir/runs_clean
+          （生产代码把文件放到 batches/<token>/ 下）
+        """
         import shutil
         spark_sql_mod = importlib.import_module("pyspark.sql")
         SparkSession = spark_sql_mod.SparkSession
@@ -477,23 +507,31 @@ class TestPySparkEndToEndIfAvailable(unittest.TestCase):
                  .master("local[1]")
                  .appName("test-p02-nullable-fields")
                  .getOrCreate())
-        cols = clean_mod.P01_RUN_COLUMNS
-        in_df = spark.createDataFrame(rows, cols)
+        if schema is None:
+            schema = clean_mod.P01_RUN_COLUMNS
+        in_df = spark.createDataFrame(rows, schema)
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         in_dir = os.path.join(tmp, "in_parquet")
         out_dir = os.path.join(tmp, "out_clean")
         report_path = os.path.join(tmp, "report.json")
-        in_df.write.mode("overwrite").parquet(in_dir)
+        in_dir_uri = Path(in_dir).as_uri()
+        out_dir_uri = Path(out_dir).as_uri()
+        in_df.write.mode("overwrite").parquet(in_dir_uri)
+
         orig_argv = sys.argv
+        orig_stop = spark.stop
+        spark.stop = lambda: None
         try:
-            sys.argv = ["clean_runs.py", in_dir, out_dir, report_path]
+            sys.argv = ["clean_runs.py", in_dir_uri, out_dir_uri, report_path]
             clean_mod.main()
         finally:
             sys.argv = orig_argv
+            spark.stop = orig_stop
+
         rep = json.loads(Path(report_path).read_text(encoding="utf-8"))
-        clean_df = spark.read.parquet(os.path.join(out_dir, "runs_clean"))
-        quarantine_df = spark.read.parquet(os.path.join(out_dir, "runs_quarantine"))
+        clean_df = spark.read.parquet(rep["clean_path"])
+        quarantine_df = spark.read.parquet(rep["quarantine_path"])
         self.addCleanup(spark.stop)
         return rep, spark, clean_df, quarantine_df
 
@@ -505,7 +543,8 @@ class TestPySparkEndToEndIfAvailable(unittest.TestCase):
              "2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z",
              "push", "completed", "success", 1, 0, 0, 0),
         ]
-        rep, spark, clean_df, quarantine_df = self._run_clean_with_rows(rows)
+        # workflow_id 整列为 None，Spark 2.0 无法推断类型，需显式 schema
+        rep, spark, clean_df, quarantine_df = self._run_clean_with_rows(rows, _p02_run_schema())
         self.assertEqual(rep["retained_rows"], 1)
         self.assertEqual(rep["total_quarantined_rows"], 0)
         clean_rows = {r["run_id"]: r for r in clean_df.collect()}

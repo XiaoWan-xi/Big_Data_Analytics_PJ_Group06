@@ -148,11 +148,9 @@ def _write_success_marker(spark, batch_dir, metadata_dict):
     fs, hpath = _hadoop_fs(spark, batch_dir.rstrip("/") + "/_SUCCESS")
     out_stream = fs.create(hpath, True)
     payload = json.dumps(metadata_dict, indent=2, sort_keys=True)
-    if isinstance(payload, unicode):  # noqa: F821
-        payload_bytes = payload.encode("utf-8")
-    else:
-        payload_bytes = payload
-    out_stream.write(bytearray(payload_bytes))
+    if not isinstance(payload, bytes):
+        payload = payload.encode("utf-8")
+    out_stream.write(bytearray(payload))
     out_stream.close()
 
 
@@ -319,6 +317,9 @@ def main():
     final_clean_path = "%s/runs_clean" % current_link_path
     final_quarantine_path = "%s/runs_quarantine" % current_link_path
 
+    report_clean_path = "%s/runs_clean" % batch_dir
+    report_quarantine_path = "%s/runs_quarantine" % batch_dir
+
 
     backup_current = None
     try:
@@ -399,8 +400,10 @@ def main():
         "application_id": sc.applicationId,
         "batch_token": batch_token,
         "input_path": input_path,
-        "clean_path": final_clean_path,
-        "quarantine_path": final_quarantine_path,
+        "clean_path": report_clean_path,
+        "quarantine_path": report_quarantine_path,
+        "current_clean_path": final_clean_path,
+        "current_quarantine_path": final_quarantine_path,
         "total_input_rows": total_input,
         "distinct_run_ids": distinct_runs,
         "retained_rows": retained_count,

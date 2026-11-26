@@ -42,7 +42,7 @@ python -m unittest discover -s tests -v
 
 ### Parquet转码
 > python3
-python ./ghawtrace/convert_for_spark2.py <input_dir> <output_dir>[limit] [--clean-output]
+python ./ghawtrace/p02/convert_for_spark2.py <input_dir> <output_dir>[limit] [--clean-output]
 <input_dir>：输入 Parquet 分片目录。
 <output_dir>：输出目录。
 [limit]：可选，只转换排序后的前 N 个分片，必须是正整数。
@@ -64,7 +64,6 @@ HDFS_URI="hdfs://10.176.62.230:9000"
   --executor-memory 1536m \
   --conf spark.sql.shuffle.partitions=24 \
   "${APP_SCRIPT}" \
-  "${LABEL}" \
   "${HDFS_URI}/${INPUT_PATH}" \
   "${HDFS_URI}/${OUTPUT_PATH}" \
   "${REPORT_OUTPUT_PATH}" 2>&1 | tee "${LOG_PATH}"
