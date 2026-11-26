@@ -48,12 +48,14 @@ _MDAYS_COMMON = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
 _MDAYS_LEAP = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
 
 
+class InjectedFault(IOError):
+    def __init__(self, stage_name):
+        self.stage_name = stage_name
+        super(InjectedFault, self).__init__("Injected fault at stage: %s" % stage_name)
+
 def _maybe_inject_fault(stage_name):
-    """Fault injection for publish robustness testing.
-    Set env P02_FAULT_INJECT=<stage_name> to raise IOError at that stage."""
-    fault = os.environ.get("P02_FAULT_INJECT")
-    if fault and fault == stage_name:
-        raise IOError("Injected fault at stage: %s" % stage_name)
+    if os.environ.get("P02_FAULT_INJECT") == stage_name:
+        raise InjectedFault(stage_name)
 
 
 def parse_utc_timestamp_py(raw_val):

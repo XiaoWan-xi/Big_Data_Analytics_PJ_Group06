@@ -21,16 +21,10 @@ except ImportError:
         return imp.load_source(name, path)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-
-clean_runs_path = os.environ.get("CLEAN_RUNS_PATH")
-if not clean_runs_path:
-    for c in ["/tmp/tests/clean_runs.py", "/tmp/p02_t03_clean_runs.py",
-              os.path.join(HERE, "clean_runs.py")]:
-        if os.path.isfile(c):
-            clean_runs_path = c
-            break
-if not clean_runs_path or not os.path.isfile(clean_runs_path):
-    print("ERROR: clean_runs.py not found. Set CLEAN_RUNS_PATH.")
+DEFAULT_CLEAN = os.path.join(HERE, "clean_runs.py")
+clean_runs_path = os.environ.get("CLEAN_RUNS_PATH") or DEFAULT_CLEAN
+if not os.path.isfile(clean_runs_path):
+    print("ERROR: clean_runs.py not found next to this script")
     sys.exit(2)
 
 print("[setup] loading clean_runs from:", clean_runs_path)

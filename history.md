@@ -199,8 +199,11 @@
 - 调用 `clean_mod.main()` 期间临时禁用 `spark.stop`、退出后恢复，解决 `main()` 停止 session 后测试再读 parquet 报 stopped SparkContext 的问题。
 - 为整列全空的 `workflow_id` fixture 显式指定 `StructType`，避免 Spark 2.0 无法推断类型。
 - `_write_success_marker` 去掉 Py2 专有的 `unicode` 检查、改用 `isinstance(payload, bytes)`，Python 3 直接调用不再抛 `NameError`。
-- 新增 `tests/node/verify_nullable_fields.py` 与 `tests/node/inject_failure.py` 并随仓库提交，作为可从仓库复跑的目标集群测试入口。
+- 新增 `ghawtrace/p02/verify_nullable_fields.py` 与 `ghawtrace/p02/inject_failure.py` 并随仓库提交，作为可从仓库复跑的目标集群测试入口。
 - 记录实际执行的 nullable、时间倒序、跨秒持久化用例结果：本地纯函数用例全通过；节点 `verify_nullable_fields.py` 10/10 PASS 覆盖 nullable 与隔离表。
 - 修正 history 中同一轮的旧计数，从“9 项 / 跳过 1 项”更新为“58 收集 / 54 通过 / 4 项 PySpark 端到端按设计跳过”。
+- 节点 nullable 验收脚本默认只加载同目录模块
+- 故障注入只接受指定故障点，无关异常判 FAIL
+- 时间列微秒持久化写后读回证据
 
 
