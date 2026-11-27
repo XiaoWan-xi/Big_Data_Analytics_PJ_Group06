@@ -206,4 +206,82 @@
 - 故障注入只接受指定故障点，无关异常判 FAIL
 - 时间列微秒持久化写后读回证据
 
+### 2026-11-27 p02review fix04
+1. 旧批次两张表与第一份报告对账
+**代码修改**
+- `ghawtrace/p02/inject_failure.py` 的 `verify_rep1_paths` 改为**始终尝试读取** `rep1["clean_path"]` 与 `rep1["quarantine_path"]`：
+  - 读表失败（目录缺失、`part-*` 不存在）直接 FAIL，不再用 `if os.path.isdir(...) else 0` 把缺失记成 0 行；
+  - 实际行数与报告 `retained_rows`、`total_quarantined_rows` 逐一比对，不匹配即 FAIL；
+  - `_SUCCESS` 中的 `batch_token` 与报告 `batch_token` 不一致也 FAIL。
+- 新增 `run_row_mismatch_regressions()`，用独立临时目录覆盖三个场景：
+  - `quarantine_missing`：删除隔离表目录 → 预期 FAIL；
+  - `clean_shrunk`：清洗表缩到 1 行（写到临时目录后替换，保留 `_SUCCESS`）→ 预期 FAIL；
+  - `quarantine_zero_ok`：隔离表存在且实读 0 行、报告 `total_quarantined_rows=0` → 预期 PASS。
+- `_run_case` 区分 `InjectedFault`（`stage_name == fp` 才算命中）与其他异常，`other_exc` 非空即 FAIL；`all_pass` 加 `bool(results)` 防空列表误判。
+**验收**
+```bash
+  ssh root@10.176.62.226
+  cd /root/ghawtrace_check
+  /opt/spark/bin/spark-submit \
+    --master local[1] \
+    --py-files ghawtrace/p02/clean_runs.py \
+    --conf spark.pyspark.python=python \
+    --conf spark.pyspark.driver.python=python \
+    ghawtrace/p02/inject_failure.py \
+    2>&1 | tee reports/p02/inject_failure.log
+```
+期望输出：
+```
+[setup] loading clean_runs from: /root/ghawtrace_check/ghawtrace/p02/clean_runs.py
+...
+FAULT INJECTION RESULTS
+PASS - after_batch_clean_write - stage=after_batch_clean_write; batch_token=local-1795735334048_c2d7ecfd; clean_rows=3; quarantine_rows=1
+PASS - after_batch_success - stage=after_batch_success; batch_token=local-1795735334048_9c860a36; clean_rows=3; quarantine_rows=1
+PASS - after_stage_success - stage=after_stage_success; batch_token=local-1795735334048_10f4a10c; clean_rows=3; quarantine_rows=1
+PASS - after_rename_current_to_backup - stage=after_rename_current_to_backup; batch_token=local-1795735334048_ced84533; clean_rows=3; quarantine_rows=1
+PASS - input_corrupted - input_corrupted: InjectedFault=False, other_exc=yes, current_unchanged=True
+PASS - quarantine_missing - rejected as expected: cannot read rep1 quarantine_path file:///tmp/p02_row_quarantine_missing_E6fqUr/out/batches/local-1795735334048_32114186/runs_quarantine: u'Path does not exist: file:/tmp/p02_row_quarantine_missing_E6fqUr/out/batches/local-1795735334048_32114186/runs_quarantine;'
+PASS - clean_shrunk - rejected as expected: rep1 clean rows mismatch: actual=1 expected=3
+PASS - quarantine_zero_ok - PASS as expected: ok
+============================================================
+RESULT: ALL PASS
+```
+2. Spark 亚秒读回结果入仓
+**代码修改**
+- 新增 ghawtrace/p02/verify_time_precision.py，从报告 rep["clean_path"] 读 Spark 实际写出的 Parquet，断言 P03 真正读取的 created_at_utc / updated_at_utc 两列微秒值： 
+- 跨秒小数：00:00:00.900001Z → 00:00:01.100002Z，created_at_utc.us=900001、updated_at_utc.us=100002、elapsed_seconds≈0.200001；
+- 同秒倒序：00:00:05.500000Z → 00:00:05.200000Z，created_at_utc.us=500000、updated_at_utc.us=200000、elapsed_seconds=None。
+- 脚本默认从同目录加载 clean_runs.py（或 CLEAN_RUNS_PATH 覆盖），不依赖 /tmp。
+**验收**
+```bash
+ssh root@10.176.62.226
+cd /root/ghawtrace_check
+/opt/spark/bin/spark-submit \
+  --master local[1] \
+  --py-files ghawtrace/p02/clean_runs.py \
+  --conf spark.pyspark.python=python \
+  --conf spark.pyspark.driver.python=python \
+  ghawtrace/p02/verify_time_precision.py \
+  2>&1 | tee reports/p02/time_precision_readback.log
+
+期望输出：
+```
+[time] row1 created_at_utc.us = 900001  (expected 900001)
+[time] row1 updated_at_utc.us = 100002  (expected 100002)
+[time] row1 elapsed_seconds   = 0.200001  (expected ~0.200001)
+[time] row2 created_at_utc.us = 500000  (expected 500000)
+[time] row2 updated_at_utc.us = 200000  (expected 200000)
+[time] row2 elapsed_seconds   = None  (expected None)
+PASS - row1 created_at_utc.us == 900001
+PASS - row1 updated_at_utc.us == 100002
+PASS - row1 elapsed_seconds ~= 0.200001
+PASS - row2 created_at_utc.us == 500000
+PASS - row2 updated_at_utc.us == 200000
+PASS - row2 elapsed_seconds is None
+RESULT: ALL PASS
+```
+验收只需两行：900001 / 100002 + 0.200001（跨秒），500000 / 200000 + None（同秒倒序），证明 Spark 2.0 写出的 Parquet 保留微秒，P03 读取的两列可靠。
+3. README中的两项指令已做修改，不再依赖临时目录，改用受控的项目检出目录
+检验完这三项之后，即可合并分支
+
 

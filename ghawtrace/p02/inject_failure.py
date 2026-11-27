@@ -116,27 +116,48 @@ def _local(p):
 
 
 def verify_rep1_paths(spark, rep1_path):
-    """From the first report, read both tables at their fixed paths and
-    return (batch_token, clean_rows, quarantine_rows) or (None, msg)."""
+    """Read the two fixed paths from the first report and check them
+    against the row counts recorded in that same report.
+
+    Missing table, unreadable table, or any row-count mismatch is a FAIL.
+    A quarantine table that exists and really holds 0 rows is acceptable
+    only when the report also says total_quarantined_rows == 0.
+    """
     with open(rep1_path) as f:
         r1 = json.load(f)
     old_clean = r1["clean_path"]
     old_q = r1["quarantine_path"]
     old_token = r1["batch_token"]
+    expected_clean = int(r1["retained_rows"])
+    expected_q = int(r1["total_quarantined_rows"])
 
-    clean_rows = spark.read.parquet(old_clean).count()
-    q_path = _local(old_q)
-    q_rows = spark.read.parquet(old_q).count() if os.path.isdir(q_path) else 0
+    # Always try to read both fixed paths; a missing table is a failure,
+    # not an implicit zero.
+    try:
+        clean_rows = spark.read.parquet(old_clean).count()
+    except Exception as e:
+        return None, "cannot read rep1 clean_path %s: %s" % (old_clean, str(e)[:200])
+
+    try:
+        q_rows = spark.read.parquet(old_q).count()
+    except Exception as e:
+        return None, "cannot read rep1 quarantine_path %s: %s" % (old_q, str(e)[:200])
 
     success_file = _local(old_clean.rsplit("/", 1)[0] + "/_SUCCESS")
-    with open(success_file) as f:
-        success_dict = json.load(f)
+    try:
+        with open(success_file) as f:
+            success_dict = json.load(f)
+    except Exception as e:
+        return None, "cannot read _SUCCESS %s: %s" % (success_file, str(e)[:200])
     success_token = success_dict.get("batch_token")
 
     if success_token != old_token:
         return None, "rep1 _SUCCESS token mismatch: %s != %s" % (success_token, old_token)
-    if clean_rows <= 0:
-        return None, "rep1 clean_path has 0 rows: %s" % old_clean
+    if clean_rows != expected_clean:
+        return None, "rep1 clean rows mismatch: actual=%d expected=%d" % (clean_rows, expected_clean)
+    if q_rows != expected_q:
+        return None, "rep1 quarantine rows mismatch: actual=%d expected=%d" % (q_rows, expected_q)
+
     return (old_token, clean_rows, q_rows), "ok"
 
 
@@ -263,6 +284,136 @@ def run_negative_regression(spark):
     finally:
         shutil.rmtree(tmp, True)
 
+def run_row_mismatch_regressions(spark):
+    """Row-count reconciliation regression.
+
+    Case A quarantine_missing : delete quarantine parquet dir -> expect FAIL
+    Case B clean_shrunk       : clean table shrunk to 1 row    -> expect FAIL
+    Case C quarantine_zero_ok : quarantine exists but 0 rows,
+                                report says total_quarantined_rows=0 -> expect PASS
+    """
+    results = []
+
+    def _local(p):
+        return p[len("file://"):] if p.startswith("file://") else p
+
+    def _preserve_success(path):
+        src = os.path.join(path, "_SUCCESS")
+        if not os.path.exists(src):
+            return None
+        tmp = src + ".kept"
+        shutil.move(src, tmp)
+        return tmp
+
+    def _restore_success(path, tmp):
+        if tmp and os.path.exists(tmp):
+            shutil.move(tmp, os.path.join(path, "_SUCCESS"))
+
+    def _run_case(case_name, mutate, expect_pass):
+        tmp = tempfile.mkdtemp(prefix="p02_row_%s_" % case_name)
+        try:
+            input_dir = os.path.join(tmp, "in")
+            output_dir = os.path.join(tmp, "out")
+            rep1 = os.path.join(tmp, "rep1.json")
+            rep2 = os.path.join(tmp, "rep2.json")
+
+            make_input(spark, input_dir)
+            if "P02_FAULT_INJECT" in os.environ:
+                del os.environ["P02_FAULT_INJECT"]
+            run_clean(input_dir, output_dir, rep1)
+
+            ok1, msg1 = current_is_complete(output_dir)
+            if not ok1:
+                return (case_name, False, "first run not usable: " + msg1)
+
+            try:
+                mutate(spark, rep1)
+            except Exception as e:
+                return (case_name, False,
+                        "mutate failed: %s: %s" % (type(e).__name__, str(e)[:200]))
+
+            os.environ["P02_FAULT_INJECT"] = "after_stage_success"
+            fault_hit = False
+            other_exc = None
+            try:
+                run_clean(input_dir, output_dir, rep2)
+            except InjectedFault as e:
+                if getattr(e, "stage_name", None) == "after_stage_success":
+                    fault_hit = True
+            except Exception as e:
+                other_exc = "%s: %s" % (type(e).__name__, str(e)[:200])
+            finally:
+                if "P02_FAULT_INJECT" in os.environ:
+                    del os.environ["P02_FAULT_INJECT"]
+
+            if not fault_hit:
+                return (case_name, False,
+                        "fault not hit" + (" (other exc: %s)" % other_exc if other_exc else ""))
+
+            info, msg = verify_rep1_paths(spark, rep1)
+            got_pass = info is not None
+            if expect_pass:
+                return (case_name, got_pass,
+                        ("PASS as expected: " + msg) if got_pass
+                        else ("expected PASS but rejected: " + msg))
+            else:
+                return (case_name, (not got_pass),
+                        ("rejected as expected: " + msg) if (not got_pass)
+                        else "expected FAIL but passed")
+        finally:
+            shutil.rmtree(tmp, True)
+
+    def _mutate_quarantine_missing(spark, rep1_path):
+        with open(rep1_path) as f:
+            r1 = json.load(f)
+        q_path = _local(r1["quarantine_path"])
+        if os.path.isdir(q_path):
+            shutil.rmtree(q_path)
+        if os.path.exists(q_path):
+            raise RuntimeError("could not remove quarantine dir: %s" % q_path)
+
+    def _mutate_clean_shrunk(spark, rep1_path):
+        with open(rep1_path) as f:
+            r1 = json.load(f)
+        clean_path = r1["clean_path"]
+        clean_local = _local(clean_path)
+        shrunk = clean_local + "_shrunk"
+
+        # 1) materialize limited data into a SEPARATE directory first
+        spark.read.parquet(clean_path).limit(1).write.mode("overwrite").parquet(
+            "file://" + shrunk
+        )
+        # 2) preserve _SUCCESS
+        kept = _preserve_success(clean_local)
+        # 3) swap directories
+        shutil.rmtree(clean_local)
+        shutil.move(shrunk, clean_local)
+        # 4) restore _SUCCESS
+        _restore_success(clean_local, kept)
+
+    def _mutate_quarantine_zero_ok(spark, rep1_path):
+        with open(rep1_path) as f:
+            r1 = json.load(f)
+        q_path = r1["quarantine_path"]
+        q_local = _local(q_path)
+
+        original_schema = spark.read.parquet(q_path).schema
+        kept = _preserve_success(q_local)
+
+        empty = spark.createDataFrame([], original_schema)
+        empty.write.mode("overwrite").parquet(q_path)
+
+        _restore_success(q_local, kept)
+
+        r1["total_quarantined_rows"] = 0
+        with open(rep1_path, "w") as f:
+            json.dump(r1, f)
+
+    results.append(_run_case("quarantine_missing", _mutate_quarantine_missing, expect_pass=False))
+    results.append(_run_case("clean_shrunk", _mutate_clean_shrunk, expect_pass=False))
+    results.append(_run_case("quarantine_zero_ok", _mutate_quarantine_zero_ok, expect_pass=True))
+    return results
+
 
 def main():
     spark = (SparkSession.builder
@@ -278,6 +429,8 @@ def main():
             results.append((fp, ok, msg))
         neg_ok, neg_msg = run_negative_regression(spark)
         results.append(("input_corrupted", neg_ok, neg_msg))
+        for case_name, ok, msg in run_row_mismatch_regressions(spark):
+            results.append((case_name, ok, msg))
     finally:
         spark.stop()
 
